@@ -1,0 +1,126 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Apron Tab AI</title>
+<style>
+  :root {
+    --bg: #fbfaf7; --fg: #1d1c1a; --muted: #6d6a64; --line: #e3e0d8; --card: #fff;
+    --accent: #b4532a; --ok: #2f7d4f; --err: #b3261e; --warn: #9a6a00; --code: #f3f1ec;
+  }
+  @media (prefers-color-scheme: dark) {
+    :root {
+      --bg: #161514; --fg: #ecebe7; --muted: #9b978f; --line: #2d2b28; --card: #1e1d1b;
+      --accent: #e0835a; --ok: #6cc28e; --err: #f2877f; --warn: #e3b34d; --code: #262422;
+    }
+  }
+  * { box-sizing: border-box; }
+  body { margin: 0; font: 14px/1.45 system-ui, sans-serif; background: var(--bg); color: var(--fg); }
+  header { padding: 14px 16px; border-bottom: 1px solid var(--line); display: flex; align-items: center; gap: 12px; flex-wrap: wrap; }
+  header h1 { font-size: 16px; margin: 0; }
+  header .status { color: var(--muted); }
+  header .status b.on { color: var(--ok); } header .status b.off { color: var(--muted); } header .status b.err { color: var(--err); }
+  main { display: grid; grid-template-columns: minmax(300px, 380px) 1fr; min-height: calc(100vh - 53px); }
+  @media (max-width: 800px) { main { grid-template-columns: 1fr; } }
+  form { padding: 12px 16px; border-right: 1px solid var(--line); overflow: auto; }
+  fieldset { border: 1px solid var(--line); border-radius: 8px; margin: 0 0 12px; padding: 8px 12px 12px; background: var(--card); }
+  legend { font-weight: 600; padding: 0 4px; }
+  label { display: block; margin-top: 8px; font-size: 12px; color: var(--muted); }
+  label.check { display: flex; gap: 6px; align-items: center; color: var(--fg); font-size: 13px; }
+  input[type=text], input[type=password], input[type=number], input:not([type]), select, textarea {
+    width: 100%; font: inherit; padding: 6px 8px; border: 1px solid var(--line); border-radius: 6px; background: var(--bg); color: var(--fg);
+  }
+  textarea { min-height: 90px; resize: vertical; }
+  .row { display: flex; gap: 8px; } .row > * { flex: 1; }
+  button { font: inherit; padding: 6px 12px; border-radius: 6px; border: 1px solid var(--line); background: var(--card); color: var(--fg); cursor: pointer; }
+  button.primary { background: var(--accent); border-color: var(--accent); color: #fff; }
+  .hint { font-size: 12px; color: var(--muted); margin: 4px 0 0; }
+  #log { padding: 8px 16px; overflow: auto; font: 12px/1.5 ui-monospace, monospace; max-height: calc(100vh - 53px); }
+  #log .e { padding: 3px 0; border-bottom: 1px dashed var(--line); white-space: pre-wrap; word-break: break-word; }
+  #log .t { color: var(--muted); margin-right: 6px; }
+  #log .k { font-weight: 600; margin-right: 6px; }
+  #log .trigger .k, #log .send .k { color: var(--accent); }
+  #log .error .k { color: var(--err); } #log .warn .k { color: var(--warn); } #log .status .k { color: var(--ok); }
+  #log details { display: inline; } #log summary { cursor: pointer; display: inline; }
+  #log pre { background: var(--code); padding: 6px; border-radius: 4px; margin: 4px 0; max-height: 300px; overflow: auto; }
+  .logbar { display: flex; gap: 12px; align-items: center; padding: 8px 16px; border-bottom: 1px solid var(--line); position: sticky; top: 0; background: var(--bg); }
+</style>
+</head>
+<body>
+<header>
+  <h1>Apron Tab AI</h1>
+  <span class="status" id="status"><b class="off">stopped</b></span>
+  <span style="flex:1"></span>
+  <button id="toggle" class="primary" form="config" type="submit">Start bot</button>
+</header>
+<main>
+  <form id="config" autocomplete="off">
+    <fieldset>
+      <legend>Language model</legend>
+      <label for="baseUrl">OpenAI-compatible base URL</label>
+      <input id="baseUrl" name="baseUrl" value="https://api.darkbloom.dev/v1">
+      <p class="hint">Darkbloom's API only allows browser requests from its own console, so point this at a CORS proxy (see <code>proxy/</code>).</p>
+      <label for="apiKey">API key</label>
+      <input id="apiKey" name="apiKey" type="password" placeholder="eigeninference-…">
+      <label for="model">Model</label>
+      <div class="row">
+        <input id="model" name="model" list="models" placeholder="model id">
+        <button type="button" id="loadModels" style="flex:0 0 auto">Load</button>
+      </div>
+      <datalist id="models"></datalist>
+      <div class="row">
+        <div><label for="temperature">Temperature</label><input id="temperature" name="temperature" type="number" step="0.1" min="0" max="2" value="0.7"></div>
+        <div><label for="maxTokens">Max tokens</label><input id="maxTokens" name="maxTokens" type="number" min="1" value="1024"></div>
+      </div>
+      <label for="mode">Actions</label>
+      <select id="mode" name="mode">
+        <option value="auto">Auto (tools, else raw)</option>
+        <option value="tools">Tool calls</option>
+        <option value="raw">Raw protocol frames</option>
+      </select>
+    </fieldset>
+
+    <fieldset>
+      <legend>Apron Chat</legend>
+      <label for="apronUrl">Server WebSocket URL</label>
+      <input id="apronUrl" name="apronUrl" value="wss://server.apron.chat/">
+      <div class="row">
+        <div><label for="scheme">Auth scheme</label>
+          <select id="scheme" name="scheme"><option>token</option><option>guest</option></select></div>
+        <div><label for="botName">Bot name</label><input id="botName" name="botName" value="Tab AI"></div>
+      </div>
+      <label for="token">Auth token</label>
+      <input id="token" name="token" type="password">
+      <label for="joinRooms">Join rooms on connect (comma-separated room_ids)</label>
+      <input id="joinRooms" name="joinRooms" placeholder="general">
+    </fieldset>
+
+    <fieldset>
+      <legend>Behavior</legend>
+      <label for="systemPrompt">System prompt</label>
+      <textarea id="systemPrompt" name="systemPrompt">You are a friendly, concise assistant living in a group chat. Help whoever mentions you.</textarea>
+      <label class="check"><input type="checkbox" name="matchText"> Also respond to @user_id in text without a listed mention</label>
+      <label class="check"><input type="checkbox" name="replyToReplies" checked> Respond to replies to the bot's messages</label>
+      <div class="row">
+        <div><label for="contextMessages">Context messages</label><input id="contextMessages" name="contextMessages" type="number" min="0" value="30"></div>
+        <div><label for="maxSteps">Max steps</label><input id="maxSteps" name="maxSteps" type="number" min="1" value="6"></div>
+        <div><label for="maxPerMinute">Replies/min</label><input id="maxPerMinute" name="maxPerMinute" type="number" min="1" value="6"></div>
+      </div>
+      <label class="check"><input type="checkbox" name="remember"> Remember keys and token in this browser</label>
+    </fieldset>
+  </form>
+
+  <section>
+    <div class="logbar">
+      <label class="check" style="margin:0"><input type="checkbox" id="showFrames"> Show protocol frames</label>
+      <label class="check" style="margin:0"><input type="checkbox" id="showLLM"> Show LLM payloads</label>
+      <span style="flex:1"></span>
+      <button type="button" id="clearLog">Clear</button>
+    </div>
+    <div id="log"></div>
+  </section>
+</main>
+<script type="module" src="src/main.js"></script>
+</body>
+</html>

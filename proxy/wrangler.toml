@@ -1,0 +1,7 @@
+name = "apron-tab-ai-proxy"
+main = "worker.js"
+compatibility_date = "2026-09-01"
+
+[vars]
+UPSTREAM = "https://api.darkbloom.dev"
+# ALLOWED_ORIGINS = "https://apron-chat.github.io,http://localhost:8000"
