@@ -15,6 +15,10 @@ it does not bypass these triggers. Replies to others require a mention.
 
 Context includes non-trigger messages and the bot's own messages from the selected
 room, in chronological order, deduplicated by message ID and latest snapshot.
+A referenced reply target appears once, explicitly marked as an earlier message,
+immediately before the trigger so it is not buried or evicted by ambient context.
+Anonymous participant labels distinguish senders without sending real IDs/names.
+Each queued request freezes its bounded context; later edits cannot change it.
 At startup, capability `history` permits one recent same-room page (64 records).
 History ingestion never triggers responses. Without history support, context is
 limited to this connection. Unknown reply targets can be resolved with exact,
@@ -44,7 +48,7 @@ variables and never generates or rotates credentials.
 | `APRON_ROOM_ID` | Optional; needed only if joined-room metadata is ambiguous |
 | `APRON_HUMAN_IDS` | Optional sender restriction, maximum 16; mentions/replies still required |
 | `BOT_BUDGET_USD` | Optional lower budget; defaults to $5 minus prior reservation |
-| `BOT_PRIOR_SPEND_USD` | Defaults to cumulative reservation `0.039465725`; cannot be lowered; update after later runs |
+| `BOT_PRIOR_SPEND_USD` | Defaults to cumulative reservation `0.126300925`; cannot be lowered; update after later runs |
 | `BOT_MAX_RUNTIME_SECONDS` | Default 300; allowed 1–600 |
 | `BOT_MIN_INTERVAL_SECONDS` | Default 15; minimum 10 between inference starts |
 | `BOT_MAX_CALLS` | Default 10; maximum 20 per process |
@@ -119,9 +123,9 @@ the bot cannot enforce shared-key spending by other processes.
 
 Before the startup hello and each completion, public model pricing is checked.
 Unavailable or invalid pricing stops the session. Each attempt reserves the
-price of the **entire 262,144-token context plus 512 generation tokens**, even though
+price of the **entire 262,144-token context plus 4,096 generation tokens**, even though
 inputs are much smaller. At verified rates of $0.075/$0.50 per million input/output
-tokens, this is $0.0199168 per attempt. Reservations are never refunded, even on
+tokens, this is $0.0217088 per attempt. Reservations are never refunded, even on
 errors, timeouts, or uncertain outcomes. There are no inference retries, automatic
 reconnects, or balance/usage-history queries.
 
@@ -143,9 +147,13 @@ method with plain text; model output cannot become a protocol command.
 Only text is sent to Darkbloom: no names, IDs, room descriptions, attachments,
 embedded messages, credentials, or assistant personal context. Context is scoped to the single selected room, at most 64 snapshots and
 12,000 UTF-8 bytes total. A separate bounded index retains up to 128 own message
-IDs for reply routing. Other participants use the user role; only this bot uses
-the assistant role. Conversation text cannot supply system instructions. Inputs are capped at 8,000 bytes; generation at 512 tokens including reasoning and posted outputs at
-1,000 characters. The queue holds eight messages; overflow and rate-limited
+IDs for reply routing. Other participants use the user role with anonymous labels; only this bot uses
+the assistant role. Conversation text cannot supply system instructions. Inputs are capped at 8,000 bytes; generation at 4,096 tokens including reasoning and posted outputs at
+1,000 characters. Complete overlong answers end at a sentence boundary with an
+explicit shortening marker; if no complete sentence fits, a fixed helpful notice
+is used. Length-stopped or empty completions always produce a fixed failure
+notice, never partial generated text. There are no regeneration or network
+retries. The queue holds eight frozen contexts; overflow and rate-limited
 messages are dropped. Shutdown clears conversation containers; Python does not
 guarantee secure memory erasure, and providers follow their own data policies.
 
@@ -184,24 +192,35 @@ read from `main` on 2026-10-08. Billing: [Darkbloom pricing](https://docs.darkbl
 
 ## Live validation and next-run reservation
 
-The first live session authenticated and acknowledged the disclosure hello, then
-stopped after one inference failed output validation; no model reply was posted.
-The next-run default and minimum cumulative reservation are
-`BOT_PRIOR_SPEND_USD=0.039465725`. This is a conservative reservation, **not
-actual charged cost**. Update it upward after any subsequent use of the key.
+The first live session acknowledged the disclosure hello, then stopped after
+one inference failed generic output validation. The next five-minute session
+loaded room history and acknowledged one reply, but the user reported that reply
+was only a fragment. Retained structural metadata showed a length stop and 123
+reasoning tokens under the old 128-token allowance. This strongly supports token
+exhaustion as the fragment's cause; the original generic rejection cannot be
+classified retroactively. Transport acknowledgement did not establish quality.
 
-The revised validator distinguishes fixed failure reasons for model mismatch,
-empty/nontext content, tool requests, secret matches, and unknown structure.
-It reports only allowlisted finish-reason/content-type enums, nonempty boolean,
-output length, and reasoning-token count. It never prints text or unknown fields.
-An empty output remains rejected; diagnosing a token-limit issue does not weaken
-the secret guard. All payloads remain in bounded runtime memory only.
+Generation now allows 4,096 tokens including reasoning, with instructions for
+one or two concise complete sentences and explicit configured model identity.
+The validator rejects tool requests, credential matches, malformed responses,
+and unknown completion finishes. Length-stopped or empty output is discarded in
+favor of a fixed helpful failure notice, without a retry or additional charge.
+Only allowlisted structural metadata is emitted; no live messages, replies,
+reasoning text, unknown fields, or credentials are logged.
 
-The revised five-minute session ended normally: history loaded, one eligible
-message, one inference, and one acknowledged reply. Cumulative reservation is
-$0.039465725, including the earlier failed inference and initial estimate.
-Allowlisted metadata showed a length stop with 123 reasoning tokens under the
-old 128-token cap. The local generation allowance is now 512 tokens; posted
-text remains capped at 1,000 characters and all output guards remain active.
-This mitigation passed synthetic tests but has not yet been run live. The exact
-cause of the original generic rejection cannot be established retroactively.
+Thirty synthetic regression tests cover the guards, completion exhaustion,
+fragment suppression, complete and overlong answers, participant attribution,
+frozen context, reply-target retention, room isolation, replay suppression,
+budgeting, and shutdown. Four paid API calls used newly synthetic prompts only,
+never live room content. Model identity and participant attribution passed; an
+initial reply-reference semantic check failed, then passed after placing the
+marked earlier reference immediately before the trigger. All four requests
+finished with `stop`; the 4,096-token request parameter was accepted. These small
+checks do not guarantee response quality for every conversation.
+
+**Next-run default and minimum cumulative reservation: $0.126300925.**
+This includes the initial estimate, both earlier live attempts, and four
+synthetic API calls conservatively reserved at $0.0217088 each. It is a
+**reservation, not actual charged cost**. The remaining ceiling is $4.873699075.
+Use `BOT_PRIOR_SPEND_USD=0.126300925` or a higher up-to-date total after any
+additional key use. No live bot session has run with these final fixes.

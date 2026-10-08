@@ -34,7 +34,7 @@ class PolicyTests(unittest.TestCase):
         env = dict(APRON_TOKEN="fake", DARKBLOOM_API_KEY="fake2",
                    DARKBLOOM_BASE_URL=bot.API_URL, APRON_ROOM_ID="test-room",
                    APRON_HUMAN_IDS="human", BOT_BUDGET_USD="0.10",
-                   BOT_PRIOR_SPEND_USD="0.039465725")
+                   BOT_PRIOR_SPEND_USD=str(bot.KNOWN_PRIOR_RESERVATION_USD))
         self.assertEqual(bot.Config.from_env(env).runtime, 300)
         self.assertNotIn("fake", repr(bot.Config.from_env(env)))
         for key, bad in [("APRON_TOKEN", ""), ("BOT_BUDGET_USD", "5"),
@@ -71,7 +71,7 @@ class PolicyTests(unittest.TestCase):
         c = bot.Config.from_env(dict(APRON_TOKEN="fake", DARKBLOOM_API_KEY="fake2",
                                      DARKBLOOM_BASE_URL=bot.API_URL))
         self.assertEqual(c.budget + c.prior_spend, Decimal("5"))
-        self.assertEqual(c.prior_spend, Decimal("0.039465725"))
+        self.assertEqual(c.prior_spend, bot.KNOWN_PRIOR_RESERVATION_USD)
         self.assertEqual(c.room, "")
         self.assertFalse(c.humans)
 
@@ -103,7 +103,7 @@ class PolicyTests(unittest.TestCase):
         self.p.observe(message("105", body={"text": "future"})["params"])
         self.assertIsNotNone(self.p.accept(message("101")))
         context = self.p.messages("human", "trigger", "101")
-        self.assertEqual([m["content"] for m in context[1:]], ["oldest", "earlier", "ambient", "trigger"])
+        self.assertEqual([m["content"] for m in context[1:]], ["Participant 1: oldest", "Participant 1: earlier", "Participant 1: ambient", "Participant 1: trigger"])
         self.assertTrue(all(m["role"] == "user" for m in context[1:]))
 
     def test_reply_to_bot_vs_other_and_unknown(self):
@@ -154,26 +154,40 @@ class PolicyTests(unittest.TestCase):
         with self.assertRaises(bot.Stop):
             self.p.reserve(Decimal("0"), 20)
 
+    def test_configured_identity_reaches_system_role(self):
+        api = bot.Darkbloom(config())
+        response = {"model": bot.MODEL, "choices": [{"finish_reason": "stop", "message": {"content": "Synthetic reply"}}]}
+        messages = self.p.messages("human", "Synthetic identity question", "101")
+        with patch.object(api, "request", return_value=response) as request:
+            api.complete(messages)
+        payload = request.call_args.args[1]
+        self.assertEqual(payload["messages"][0]["role"], "system")
+        identity = payload["messages"][0]["content"]
+        self.assertIn(payload["model"], identity)
+        self.assertIn("Bonsai 2 27B", identity)
+        self.assertIn("served via Darkbloom", identity)
+        self.assertEqual(sum(m["role"] == "system" for m in payload["messages"]), 1)
+
     def test_pricing_payload_and_output(self):
         api = bot.Darkbloom(config())
         with patch.object(api, "request", return_value={"prices": [
                 {"model": bot.MODEL, "input_usd": "$0.0750", "output_usd": "$0.5000"}]}):
-            self.assertEqual(api.reservation(), Decimal("0.0199168"))
-        response = {"model": bot.MODEL, "choices": [{"message": {"content": "Synthetic reply"}}]}
+            self.assertEqual(api.reservation(), Decimal("0.0217088"))
+        response = {"model": bot.MODEL, "choices": [{"finish_reason": "stop", "message": {"content": "Synthetic reply"}}]}
         with patch.object(api, "request", return_value=response) as request:
             self.assertEqual(api.complete(self.p.messages("human", "hi")), "Synthetic reply")
             payload = request.call_args.args[1]
             self.assertEqual(set(payload), {"model", "messages", "stream", "max_tokens"})
             self.assertFalse(payload["stream"])
-            self.assertEqual(payload["max_tokens"], 512)
+            self.assertEqual(payload["max_tokens"], 4096)
             self.assertNotIn("synthetic-api-secret", json.dumps(payload))
-        for text in ("synthetic-api-secret", "synthetic-apron-secret", ""):
+        for text in ("synthetic-api-secret", "synthetic-apron-secret"):
             response["choices"][0]["message"]["content"] = text
             with patch.object(api, "request", return_value=response), self.assertRaises(bot.Stop):
                 api.complete([])
         response["choices"][0]["message"] = {"content": "x"*5000}
         with patch.object(api, "request", return_value=response):
-            self.assertEqual(len(api.complete([])), 1000)
+            self.assertEqual(api.complete([]), "The answer exceeded the reply limit. Please ask for one specific point.")
         response["choices"][0]["message"]["tool_calls"] = [{"name": "shell"}]
         with patch.object(api, "request", return_value=response), self.assertRaises(bot.Stop):
             api.complete([])
@@ -184,8 +198,7 @@ class PolicyTests(unittest.TestCase):
                   "usage": {"completion_tokens_details": {"reasoning_tokens": 128}}}
         output = io.StringIO()
         with patch.object(api, "request", return_value=result), redirect_stdout(output):
-            with self.assertRaisesRegex(bot.Stop, "^model_output_empty_or_nontext$"):
-                api.complete([])
+            self.assertEqual(api.complete([]), bot.INCOMPLETE_REPLY)
         record = json.loads(output.getvalue())
         self.assertEqual(record, {"status": "model_output_metadata", "finish_reason": "length",
             "content_type": "text", "content_nonempty": False, "output_length": 0, "reasoning_tokens": 128})
@@ -196,6 +209,58 @@ class PolicyTests(unittest.TestCase):
                 api.complete([])
         self.assertNotIn("synthetic", output.getvalue())
         self.assertEqual(json.loads(output.getvalue())["finish_reason"], "unknown")
+
+    def test_completion_exhaustion_empty_fragment_and_complete(self):
+        api = bot.Darkbloom(config())
+        cases = [("length", "", bot.INCOMPLETE_REPLY),
+                 ("length", "I'm a", bot.INCOMPLETE_REPLY),
+                 ("stop", "", bot.INCOMPLETE_REPLY),
+                 ("stop", None, bot.INCOMPLETE_REPLY),
+                 ("stop", "A complete synthetic answer.", "A complete synthetic answer.")]
+        for finish, content, expected in cases:
+            result = {"model": bot.MODEL, "choices": [{"finish_reason": finish, "message": {"content": content}}],
+                "usage": {"completion_tokens_details": {"reasoning_tokens": 4096 if finish == "length" else 8}}}
+            with patch.object(api, "request", return_value=result) as request:
+                self.assertEqual(api.complete([]), expected)
+                request.assert_called_once()
+        result["choices"][0] = {"finish_reason": "length", "message": {"content": "synthetic-api-secret"}}
+        with patch.object(api, "request", return_value=result), self.assertRaisesRegex(bot.Stop, "^model_output_secret_guard$"):
+            api.complete([])
+
+    def test_long_complete_reply_uses_sentence_boundary(self):
+        answer = "A complete synthetic sentence. " * 80
+        bounded = bot.bounded_reply(answer)
+        self.assertLessEqual(len(bounded), 1000)
+        self.assertTrue(bounded.endswith(". [Answer shortened.]"))
+        self.assertTrue(answer.startswith(bounded.removesuffix(" [Answer shortened.]")))
+        self.assertNotIn("x"*50, bot.bounded_reply("x"*2000))
+
+    def test_anonymous_sender_attribution(self):
+        for ident, user in [("90", "first-real-id"), ("91", "second-real-id"), ("92", "first-real-id")]:
+            self.p.observe(message(ident, body={"text": "Synthetic."}, **{"from": {"user_id": user}})["params"])
+        context = self.p.messages("second-real-id", "Trigger.", "101")
+        self.assertTrue(context[1]["content"].startswith("Participant 1: "))
+        self.assertTrue(context[2]["content"].startswith("Participant 2: "))
+        self.assertTrue(context[3]["content"].startswith("Participant 1: "))
+        self.assertTrue(context[-1]["content"].startswith("Participant 2: "))
+        self.assertNotIn("real-id", json.dumps(context))
+
+    def test_reply_target_survives_context_pruning(self):
+        self.p.observe(message("90", body={"text": "Pinned bot answer."}, **{"from": {"user_id": "self"}})["params"])
+        target = 90, self.p.history[90]
+        for i in range(91, 108):
+            self.p.observe(message(str(i), body={"text": "x"*1000})["params"])
+        self.assertNotIn(90, self.p.history)
+        context = self.p.messages("human", "trigger"*1000, "109", target)
+        self.assertIn({"role": "assistant", "content": "[Message being replied to] Pinned bot answer."}, context)
+        self.assertLessEqual(sum(len(m["content"].encode()) for m in context[1:]), 12000)
+        self.assertEqual(sum("Pinned bot answer." in m["content"] for m in context), 1)
+        self.assertIn("Pinned bot answer.", context[-2]["content"])
+        self.assertIn("Reply to the referenced message", context[-1]["content"])
+
+    def test_later_edit_not_in_earlier_trigger_context(self):
+        self.p.observe(message("90", log_id="110", body={"text": "future edit"})["params"])
+        self.assertNotIn("future edit", json.dumps(self.p.messages("human", "trigger", "101")))
 
     def test_sanitized_failure_no_retry_no_redirect(self):
         api = bot.Darkbloom(config())
@@ -367,15 +432,28 @@ class SessionTests(unittest.IsolatedAsyncioTestCase):
             await self.until(lambda: session.stats["replies"] == 1)
             self.assertEqual(session.stats["reply_lookups"], 1)
             context = api.calls[0]
-            self.assertIn({"role": "user", "content": "room background"}, context)
-            self.assertIn({"role": "assistant", "content": "old bot turn"}, context)
-            self.assertEqual(context[-1], {"role": "user", "content": "reply trigger"})
-            self.assertEqual(sum(m["content"] == "reply trigger" for m in context), 1)
+            self.assertIn({"role": "user", "content": "Participant 1: room background"}, context)
+            self.assertIn({"role": "assistant", "content": "[Message being replied to] old bot turn"}, context)
+            self.assertEqual(context[-1], {"role": "user", "content": "[Reply to the referenced message immediately above] Participant 1: reply trigger"})
+            self.assertEqual(sum(m["content"] == "[Reply to the referenced message immediately above] Participant 1: reply trigger" for m in context), 1)
         finally:
             task.cancel()
             await asyncio.gather(task, return_exceptions=True)
         self.assertFalse(session.policy.history)
         self.assertFalse(session.resolvers)
+
+    async def test_queued_context_is_frozen_and_known_target_can_be_fetched(self):
+        session = bot.Session(FakeSocket(), config(), FakeAPI())
+        session.policy.you, session.policy.watermark = "self", 100
+        session.server = {"capabilities": ["history"]}
+        session.policy.observe(message("90", body={"text": "earlier"})["params"])
+        session.enqueue(message("101"))
+        item = session.queue.get_nowait()
+        session.policy.observe(message("90", log_id="110", body={"text": "later"})["params"])
+        self.assertIn("earlier", json.dumps(item[3]))
+        self.assertNotIn("later", json.dumps(item[3]))
+        session.policy.own_ids[50] = True
+        self.assertTrue(session.needs_lookup(message("102", body={"text": "reply"}, reply_to={"message_id": "50"})))
 
     async def test_runtime_and_operator_stop(self):
         class FakeConnect:
