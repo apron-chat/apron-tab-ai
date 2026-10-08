@@ -179,7 +179,7 @@ APRON_GO_BINARY=/absolute/path/to/aprond python3 -B -m unittest discover -q
 ```
 
 Without `APRON_GO_BINARY`, only the three real-server tests are skipped. The
-verified suite has 89 tests. Integration covers actual authenticated caller
+verified deterministic/local suite has 89 tests. Integration covers actual authenticated caller
 metadata, topic-fixture selection, thread creation, moving bot-authored messages,
 client-field/author preservation, unrelated messages left in place, both general
 and thread summaries with titles preserved, other-author move denial (-32001),
@@ -188,6 +188,27 @@ one confirmed move. Unit tests additionally cover pagination, invalid plans,
 injection evidence, credentials, bounded history, expiry/replay and reservations.
 The planner was a deterministic synthetic fixture; no paid model calls were made.
 Real model selection quality remains subject to the visible confirmation preview.
+
+An additional opt-in actual-Darkbloom test subsequently passed against the same
+unmodified local Go server: `test_synthetic_planner.SyntheticPlanner`. Two model
+calls selected exactly the two fictional Project Aster deployment messages out of
+interleaved unrelated lunch discussion, produced a project-specific title and a
+summary preserving Friday timing and rollback, then summarized the resulting
+thread. The real local executor moved only those messages, preserved their client
+fields/authors, rejected a different caller and confirmation replay, and updated
+the thread description without changing its title. Only booleans, counts and
+cost metadata were emitted; no model/API payloads were logged or persisted.
+
+This paid test requires explicit `APRON_SYNTHETIC_PLANNER=1` as well as
+`APRON_GO_BINARY`; normal discovery skips it (90 total tests, one paid-test skip
+when the Go binary is configured). It uses only the configured Darkbloom key,
+never the real Apron token, and atomically reserves each call in the existing
+service ledger before dispatch. At most two calls occur in the scenario, with a
+three-attempt process ceiling and no retry. The verified run reserved $0.072089600,
+bringing the ledger to $0.465449725 at completion; always read the current ledger
+instead of using this historical figure to initialize or reset accounting. This
+is a successful bounded synthetic example, not a guarantee of future selection
+quality; owner confirmation remains required.
 
 **Server differences:** this Go revision allows any authenticated visible-room
 edit, including `general`, and nested threads. But edits/moves require the original
