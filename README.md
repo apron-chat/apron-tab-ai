@@ -248,4 +248,43 @@ no retries. The session's existing runtime and hard shutdown still apply; a high
 token ceiling does not guarantee a full 32,768-token generation before those time
 limits. Responses remain bounded and length-stopped fragments are never posted.
 The 32,768 configuration and timeout passed synthetic tests only; no paid maximum-
-size probe or new live session was started. Thirty-one regression tests pass.
+size probe or new live session was started. Thirty-seven regression tests pass.
+
+## API failure diagnostics and recovery
+
+The previously retained `api_request_failed` confirms the fourth reserved
+completion failed before model-output validation, but the old generic exception
+handler discarded its type. A timeout is plausible under the old 30-second HTTP
+limit, not established. HTTP errors, network errors, and invalid JSON were also
+mapped to that same status. No live payload or historical response was inspected.
+
+New `api_failure` diagnostics contain only a fixed phase (`pricing` or
+`completion`), fixed category, numeric HTTP status (zero when unavailable), and
+recoverable boolean. Categories distinguish HTTP, rate limit, authentication,
+timeout, transport, parsing, TLS verification, and unknown failures. Remote error
+text, response bodies, headers, URLs, and exception representations are never
+logged. HTTP error bodies are closed without reading; no Retry-After header is
+read or exposed.
+
+During message processing, HTTP 408/425/429/5xx, transport/timeouts, and malformed
+JSON skip the affected trigger and preserve the listener. Each failed paid
+attempt remains fully reserved; the trigger is never retried. Pending triggers
+are discarded, and new triggers during a local exponential backoff are dropped.
+Backoff starts at 30 seconds (60 for rate limits), caps at 120 seconds, and resets
+after an acknowledged reply. A subsequent new trigger can run after backoff if
+budget, call-count, and runtime limits still permit it. Failures fetching pricing
+do not initiate or reserve a completion.
+
+Authentication (401/403), billing/configuration and other nontransient HTTP errors,
+TLS verification, unknown failures, and existing output-privacy guards still stop
+the session. Startup pricing failure stops before hello because no safe budget
+reservation can be established. Apron send/acknowledgment failures are not retried.
+This improves bounded-session resilience; it does not install a persistent service,
+add automatic restarts, or relax the hard cumulative $5 ceiling.
+
+Synthetic tests cover safe failure categories, no error-body reads, successful
+listener recovery on a later trigger, no failed-trigger replay or duplicate send,
+unrefunded reservations, pricing failure without inference, authentication/config
+shutdown, and increasing backoff bounded by the existing budget. No new live bot
+or paid inference was run for this change. Cumulative reservation remains
+$0.213136125 (not actual charged cost).

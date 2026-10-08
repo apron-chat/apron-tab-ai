@@ -7,7 +7,7 @@ from contextlib import redirect_stdout
 import json
 import signal
 import unittest
-from unittest.mock import patch
+from unittest.mock import patch, Mock
 import bot
 
 
@@ -266,15 +266,61 @@ class PolicyTests(unittest.TestCase):
         api = bot.Darkbloom(config())
         for path, payload, timeout in [("/pricing", None, 30), ("/chat/completions", {}, 120)]:
             with patch.object(api.opener, "open", side_effect=TimeoutError()) as request:
-                with self.assertRaisesRegex(bot.Stop, "^api_request_failed$"):
+                with self.assertRaisesRegex(bot.ApiFailure, "^api_timeout$"):
                     api.request(path, payload)
                 self.assertEqual(request.call_args.kwargs["timeout"], timeout)
                 request.assert_called_once()
 
+    def test_api_failure_diagnostics_exclude_remote_content(self):
+        api = bot.Darkbloom(config())
+        remote = "synthetic-sensitive-error-material"
+        cases = [
+            (TimeoutError(remote), "timeout", 0, True),
+            (bot.urllib.error.URLError(TimeoutError(remote)), "timeout", 0, True),
+            (bot.urllib.error.URLError(remote), "transport", 0, True),
+            (ConnectionResetError(remote), "transport", 0, True),
+            (bot.ssl.SSLCertVerificationError(remote), "tls", 0, False),
+            (RuntimeError(remote), "unknown", 0, False),
+        ]
+        bodies = []
+        for code, category, transient in [(400, "http", False), (401, "authentication", False),
+                (402, "http", False), (403, "authentication", False), (408, "http", True),
+                (429, "rate_limit", True), (503, "http", True)]:
+            body = Mock()
+            bodies.append(body)
+            error = bot.urllib.error.HTTPError("https://synthetic.invalid/"+remote, code, remote,
+                                               {"Authorization": remote, "Retry-After": remote}, body)
+            cases.append((error, category, code, transient))
+        for error, category, code, transient in cases:
+            output = io.StringIO()
+            with patch.object(api.opener, "open", side_effect=error) as request, redirect_stdout(output):
+                with self.assertRaises(bot.ApiFailure) as raised:
+                    api.request("/chat/completions", {})
+            self.assertEqual(raised.exception.category, category)
+            self.assertEqual(raised.exception.transient, transient)
+            self.assertEqual(json.loads(output.getvalue()), {"status":"api_failure", "phase":"completion",
+                "category":category, "http_status":code, "recoverable":transient})
+            self.assertNotIn(remote, str(raised.exception))
+            self.assertNotIn(remote, output.getvalue())
+            request.assert_called_once()
+        for body in bodies:
+            body.read.assert_not_called()
+
+    def test_parsing_failure_is_sanitized(self):
+        api = bot.Darkbloom(config())
+        for body in (b"synthetic invalid json", b"\xff"):
+            output = io.StringIO()
+            with patch.object(api.opener, "open", return_value=io.BytesIO(body)), redirect_stdout(output):
+                with self.assertRaises(bot.ApiFailure) as raised:
+                    api.request("/chat/completions", {})
+            self.assertEqual(raised.exception.category, "parsing")
+            self.assertTrue(raised.exception.transient)
+            self.assertNotIn("synthetic", output.getvalue())
+
     def test_sanitized_failure_no_retry_no_redirect(self):
         api = bot.Darkbloom(config())
         with patch.object(api.opener, "open", side_effect=RuntimeError("sensitive body")) as request:
-            with self.assertRaisesRegex(bot.Stop, "^api_request_failed$"):
+            with self.assertRaisesRegex(bot.ApiFailure, "^api_unknown$"):
                 api.request("/chat/completions", {})
             self.assertEqual(request.call_count, 1)
         self.assertIsNone(bot.NoRedirect().redirect_request(None, None, None, None, None, None))
@@ -412,6 +458,93 @@ class SessionTests(unittest.IsolatedAsyncioTestCase):
             self.assertEqual(complete.call_count, 1)
             self.assertEqual(session.policy.reserved, Decimal("0.02"))
             self.assertEqual(session.stats["replies"], 0)
+
+    async def test_transient_paid_failure_keeps_listener_and_never_retries_trigger(self):
+        socket, api = FakeSocket(), FakeAPI()
+        session = bot.Session(socket, config(), api)
+        with patch.object(api, "complete", side_effect=[bot.ApiFailure("timeout"), "Synthetic recovery reply."]) as complete:
+            task = asyncio.create_task(session.run())
+            try:
+                await self.until(lambda: session.stats["ready"])
+                socket.incoming.put_nowait(json.dumps(message("101")))
+                await self.until(lambda: session.stats["api_failures"] == 1)
+                self.assertFalse(task.done())
+                self.assertGreater(session.policy.next_call, bot.time.monotonic())
+                self.assertEqual(session.stats["backoff_seconds"], 30)
+                self.assertEqual(session.policy.reserved, Decimal("0.02"))
+                socket.incoming.put_nowait(json.dumps(message("101")))  # Replay of failed trigger.
+                socket.incoming.put_nowait(json.dumps(message("102")))  # New trigger during backoff.
+                await self.until(lambda: session.stats["rate_dropped"] == 1)
+                self.assertEqual(complete.call_count, 1)
+                session.policy.next_call = 0  # Advance the synthetic backoff without sleeping.
+                socket.incoming.put_nowait(json.dumps(message("103")))
+                await self.until(lambda: session.stats["replies"] == 1)
+                self.assertEqual(complete.call_count, 2)
+                self.assertEqual(session.policy.reserved, Decimal("0.04"))
+                replies = [f for f in socket.sent if "reply_to" in f.get("params", {})]
+                self.assertEqual(len(replies), 1)
+                self.assertEqual(replies[0]["params"]["reply_to"], {"message_id":"103"})
+                self.assertEqual(session.api_failure_streak, 0)
+            finally:
+                task.cancel()
+                await asyncio.gather(task, return_exceptions=True)
+
+    async def test_transient_pricing_failure_never_spends_without_pricing(self):
+        socket, api = FakeSocket(), FakeAPI()
+        session = bot.Session(socket, config(), api)
+        with patch.object(api, "reservation", side_effect=[Decimal("0.02"), bot.ApiFailure("http",503), Decimal("0.02")]):
+            task = asyncio.create_task(session.run())
+            try:
+                await self.until(lambda: session.stats["ready"])
+                socket.incoming.put_nowait(json.dumps(message("101")))
+                await self.until(lambda: session.stats["api_failures"] == 1)
+                self.assertFalse(task.done())
+                self.assertFalse(api.calls)
+                self.assertEqual(session.policy.reserved, Decimal("0"))
+                session.policy.next_call = 0
+                socket.incoming.put_nowait(json.dumps(message("102")))
+                await self.until(lambda: session.stats["replies"] == 1)
+                self.assertEqual(session.policy.reserved, Decimal("0.02"))
+            finally:
+                task.cancel()
+                await asyncio.gather(task, return_exceptions=True)
+
+    async def test_authentication_and_configuration_api_failures_stop(self):
+        for category, code in [("authentication",401),("authentication",403),("http",400),("http",402)]:
+            socket, api = FakeSocket(), FakeAPI()
+            session = bot.Session(socket, config(), api)
+            with patch.object(api,"complete",side_effect=bot.ApiFailure(category,code)) as complete:
+                task = asyncio.create_task(session.run())
+                await self.until(lambda: session.stats["ready"])
+                socket.incoming.put_nowait(json.dumps(message("101")))
+                with self.assertRaises(bot.ApiFailure):
+                    await asyncio.wait_for(task, 2)
+                complete.assert_called_once()
+                self.assertEqual(session.policy.reserved,Decimal("0.02"))
+                self.assertEqual(session.stats["replies"],0)
+
+    async def test_repeated_transient_failures_backoff_and_budget_remain_bounded(self):
+        socket, api = FakeSocket(), FakeAPI()
+        session = bot.Session(socket, config(budget=Decimal("0.04")), api)
+        with patch.object(api,"complete",side_effect=bot.ApiFailure("rate_limit",429)) as complete:
+            task=asyncio.create_task(session.run())
+            try:
+                await self.until(lambda:session.stats["ready"])
+                for ident, expected in [("101",60),("102",120)]:
+                    session.policy.next_call=0
+                    socket.incoming.put_nowait(json.dumps(message(ident)))
+                    await self.until(lambda:session.stats["backoff_seconds"]==expected)
+                    self.assertLessEqual(session.stats["backoff_seconds"],120)
+                session.policy.next_call=0
+                socket.incoming.put_nowait(json.dumps(message("103")))
+                with self.assertRaisesRegex(bot.Stop,"^budget_limit$"):
+                    await asyncio.wait_for(task,2)
+                self.assertEqual(complete.call_count,2)
+                self.assertEqual(session.policy.reserved,Decimal("0.04"))
+                self.assertEqual(session.stats["replies"],0)
+            finally:
+                task.cancel()
+                await asyncio.gather(task,return_exceptions=True)
 
     async def test_history_bootstrap_no_replay_trigger_and_reply_resolution(self):
         class HistorySocket(FakeSocket):

@@ -6,10 +6,12 @@ from contextlib import suppress
 from dataclasses import dataclass, field
 from decimal import Decimal, InvalidOperation
 import json
+import http.client
 import logging
 import os
 import re
 import signal
+import ssl
 import time
 import urllib.error
 import urllib.request
@@ -51,6 +53,26 @@ SYSTEM = (
 
 class Stop(Exception):
     """Only fixed, locally authored reason codes belong in this exception."""
+
+
+class ApiFailure(Stop):
+    """Fixed classification only; never retain remote text or exception objects."""
+    def __init__(self, category, http_status=0):
+        if category not in {"http", "rate_limit", "authentication", "timeout", "transport", "parsing", "tls", "unknown"}:
+            category = "unknown"
+        self.category = category
+        self.http_status = http_status if type(http_status) is int and 100 <= http_status <= 599 else 0
+        self.transient = (category in {"rate_limit", "timeout", "transport", "parsing"}
+                          or category == "http" and (self.http_status in {408, 425} or self.http_status >= 500))
+        super().__init__("api_" + category)
+
+
+def api_failure(category, phase, http_status=0):
+    failure = ApiFailure(category, http_status)
+    print(json.dumps({"status": "api_failure", "phase": phase if phase in ("pricing", "completion") else "unknown",
+                      "category": failure.category, "http_status": failure.http_status,
+                      "recoverable": failure.transient}), flush=True)
+    return failure
 
 
 @dataclass(repr=False)
@@ -127,6 +149,7 @@ class Darkbloom:
             headers.update({"Content-Type": "application/json",
                             "Authorization": "Bearer " + self.config.api_key})
         request = urllib.request.Request(API_URL + path, data=data, headers=headers)
+        phase = "completion" if payload is not None else "pricing"
         try:
             with self.opener.open(request, timeout=COMPLETION_TIMEOUT_SECONDS if payload is not None else 30) as response:
                 body = response.read(262145)
@@ -135,9 +158,26 @@ class Darkbloom:
                 return json.loads(body)
         except Stop:
             raise
+        except urllib.error.HTTPError as exc:
+            code = exc.code if type(exc.code) is int else 0
+            category = "authentication" if code in (401, 403) else "rate_limit" if code == 429 else "http"
+            with suppress(Exception):
+                exc.close()  # Do not inspect body, headers, URL, or reason.
+            raise api_failure(category, phase, code) from None
+        except TimeoutError:
+            raise api_failure("timeout", phase) from None
+        except ssl.SSLCertVerificationError:
+            raise api_failure("tls", phase) from None
+        except urllib.error.URLError as exc:
+            category = ("timeout" if isinstance(exc.reason, TimeoutError)
+                        else "tls" if isinstance(exc.reason, ssl.SSLCertVerificationError) else "transport")
+            raise api_failure(category, phase) from None
+        except (json.JSONDecodeError, UnicodeDecodeError):
+            raise api_failure("parsing", phase) from None
+        except (OSError, http.client.HTTPException):
+            raise api_failure("transport", phase) from None
         except Exception:
-            # HTTP errors may contain reflected input or credentials. Never render them.
-            raise Stop("api_request_failed") from None
+            raise api_failure("unknown", phase) from None
 
     def reservation(self):
         data = self.request("/pricing")
@@ -401,6 +441,7 @@ class Session:
         self.own_creation_rooms = {}
         self.resolvers = set()
         self.next_lookup = 0.0
+        self.api_failure_streak = 0
         self.report = report or (lambda status, session: None)
 
     async def rpc(self, method, params):
@@ -539,15 +580,32 @@ class Session:
             if now < self.policy.next_call:
                 self.stats["rate_dropped"] += 1
                 continue
-            amount = await asyncio.to_thread(self.api.reservation)
-            self.policy.reserve(amount, time.monotonic())
-            self.stats["calls"] += 1
-            self.report("call_reserved", self)
-            reply = await asyncio.to_thread(self.api.complete, context)
+            try:
+                amount = await asyncio.to_thread(self.api.reservation)
+                self.policy.reserve(amount, time.monotonic())
+                self.stats["calls"] += 1
+                self.report("call_reserved", self)
+                reply = await asyncio.to_thread(self.api.complete, context)
+            except ApiFailure as failure:
+                if not failure.transient:
+                    raise
+                # Drop this trigger. Its paid reservation is never refunded, and
+                # it is never retried after an uncertain remote outcome.
+                self.api_failure_streak = min(self.api_failure_streak + 1, 3)
+                backoff = min(120, (60 if failure.category == "rate_limit" else 30) * 2**(self.api_failure_streak - 1))
+                self.policy.next_call = max(self.policy.next_call, time.monotonic() + backoff)
+                self.stats["api_failures"] += 1
+                self.stats["backoff_seconds"] = backoff
+                while not self.queue.empty():
+                    self.queue.get_nowait()
+                    self.stats["backoff_dropped"] += 1
+                self.report("api_backoff", self)
+                continue
             # The model can supply plain text only, never protocol methods or destinations.
             sent = await self.rpc("message", {"room_id": self.config.room,
                            "reply_to": {"message_id": ident},
                            "body": {"text": reply, "format": "plain"}})
+            self.api_failure_streak = 0
             self.stats["replies"] += 1
             self.report("reply_sent", self)
             self.policy.observe({"room_id": self.config.room,
