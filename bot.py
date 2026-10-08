@@ -86,6 +86,8 @@ class Config:
     interval: int = 15
     max_calls: int = 10
     prior_spend: Decimal = KNOWN_PRIOR_RESERVATION_USD
+    ledger: object = field(default=None, repr=False)
+    service_mode: bool = False
 
     @classmethod
     def from_env(cls, env):
@@ -418,12 +420,14 @@ class Policy:
         return [{"role": "system", "content": SYSTEM}, *turns, current]
 
     def reserve(self, amount, now):
-        if self.calls >= self.config.max_calls:
+        if not self.config.service_mode and self.calls >= self.config.max_calls:
             raise Stop("call_limit")
         if (not amount.is_finite() or amount < 0
                 or self.reserved + amount > self.config.budget
                 or self.config.prior_spend + self.reserved + amount > Decimal("5")):
             raise Stop("budget_limit")
+        if self.config.ledger is not None:
+            self.config.ledger.reserve(amount)  # Atomic durable reservation precedes the paid request.
         self.reserved += amount  # Never refund, even on timeout or missing usage.
         self.calls += 1
         self.next_call = now + self.config.interval
@@ -621,6 +625,7 @@ class Session:
         self.policy.you = auth.get("you", {}).get("user_id")
         if not isinstance(self.policy.you, str) or not self.policy.you:
             raise Stop("authentication_failed")
+        self.stats["authenticated"] = 1
         # A rotated token is never printed or persisted; this process never reconnects.
         if auth.get("token"):
             self.stats["token_rotation"] += 1
@@ -645,29 +650,44 @@ class Session:
         reservation = await asyncio.to_thread(self.api.reservation)
         if reservation > self.config.budget:
             raise Stop("budget_limit")
-        params = {"body": {"text": HELLO, "format": "plain"}}
-        if self.config.room:
-            params["room_id"] = self.config.room
-        hello = await self.rpc("message", params)
-        if not self.config.room:
-            self.config.room = self.own_creation_rooms.get(hello.get("message_id"), "")
+        self.stats["room_selected"] = 1
+        send_hello = self.config.ledger is None or self.config.ledger.claim_hello()
+        hello = None
+        if send_hello:
+            params = {"body": {"text": HELLO, "format": "plain"}}
+            if self.config.room:
+                params["room_id"] = self.config.room
+            hello = await self.rpc("message", params)
             if not self.config.room:
-                raise Stop("default_room_unresolved")
+                self.config.room = self.own_creation_rooms.get(hello.get("message_id"), "")
+                if not self.config.room:
+                    raise Stop("default_room_unresolved")
+            self.policy.observe({"room_id": self.config.room,
+                "message_id": hello.get("message_id"), "log_id": hello.get("message_id"),
+                "from": {"user_id": self.policy.you}, "body": {"text": HELLO}})
+            self.stats["hello_acknowledged"] = 1
         self.own_creation_rooms.clear()
-        self.policy.watermark = log_id(hello.get("message_id"))
-        self.policy.observe({"room_id": self.config.room,
-            "message_id": hello.get("message_id"), "log_id": hello.get("message_id"),
-            "from": {"user_id": self.policy.you}, "body": {"text": HELLO}})
+        cutoff = log_id(hello.get("message_id")) if hello else None
         if "history" in server.get("capabilities", []):
-            recent = await self.rpc("history", {"room_id": self.config.room,
-                "before": hello["message_id"], "limit": 64})
+            if not self.config.room:
+                raise Stop("resume_room_unresolved")
+            params = {"room_id": self.config.room, "limit": 64}
+            if hello:
+                params["before"] = hello["message_id"]
+            recent = await self.rpc("history", params)
             snapshots = recent.get("messages", [])
             if not isinstance(snapshots, list):
                 raise Stop("history_invalid")
             for snapshot in snapshots:
                 self.policy.observe(snapshot)
+            if cutoff is None:
+                cutoff = log_id(recent.get("latest_log_id"))
             del recent, snapshots
             self.stats["history_loaded"] = 1
+        if cutoff is None:
+            raise Stop("resume_history_required")
+        # Never trigger from startup/history or retry a previous connection's work.
+        self.policy.watermark = max([cutoff, *self.policy.history.keys()])
         self.stats["ready"] = 1
         self.report("ready", self)
         await self.work()
@@ -698,7 +718,10 @@ class Session:
 
 
 async def live(config):
+    if config.service_mode and config.ledger is None:
+        raise Stop("ledger_invalid")
     from websockets.asyncio.client import connect
+    from websockets.exceptions import ConnectionClosed, InvalidStatus
 
     class FixedConnection(connect):
         def process_redirect(self, exc):
@@ -723,7 +746,8 @@ async def live(config):
         stop_event.set()
 
     signal.signal(signal.SIGALRM, hard_stop)
-    signal.alarm(config.runtime + 5)
+    if not config.service_mode:
+        signal.alarm(config.runtime + 5)
     for sig in (signal.SIGINT, signal.SIGTERM):
         loop.add_signal_handler(sig, request_stop)
 
@@ -744,7 +768,7 @@ async def live(config):
     stopper = asyncio.create_task(stop_event.wait())
     reason = "runtime_limit"
     try:
-        done, _ = await asyncio.wait([task, stopper], timeout=config.runtime,
+        done, _ = await asyncio.wait([task, stopper], timeout=None if config.service_mode else config.runtime,
                                      return_when=asyncio.FIRST_COMPLETED)
         if stopper in done:
             reason = "operator_stop"
@@ -752,7 +776,12 @@ async def live(config):
             await task
             reason = "session_finished"
     except Stop as exc:
-        reason = str(exc)
+        reason = "api_http_transient" if isinstance(exc, ApiFailure) and exc.category == "http" and exc.transient else str(exc)
+    except InvalidStatus as exc:
+        code = exc.response.status_code
+        reason = "connection_unavailable" if code in (408, 429) or 500 <= code <= 599 else "authentication_failed" if code in (401, 403) else "protocol_invalid"
+    except (OSError, TimeoutError, ConnectionClosed):
+        reason = "connection_unavailable"
     except Exception:
         reason = "operation_failed"
     finally:
@@ -764,6 +793,7 @@ async def live(config):
             stats["reserved_usd"] = str(session.policy.reserved)
             stats["cumulative_reserved_usd"] = str(config.prior_spend + session.policy.reserved)
         print(json.dumps({"status": reason, "counts": dict(stats)}), flush=True)
+    return reason
 
 
 def main():

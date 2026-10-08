@@ -131,8 +131,8 @@ reconnects, or balance/usage-history queries.
 
 Final aggregate status includes `cumulative_reserved_usd`. **Before any manual
 restart**, set `BOT_PRIOR_SPEND_USD` to that total. If the report is lost, account
-for the entire previous per-run budget. No ledger is persisted: cross-run
-correctness requires this operator step and the provider's cap. In-flight price
+for the entire previous per-run budget. Foreground runs do not persist a ledger: cross-run correctness requires this
+operator step and the provider's cap. Supervised mode below uses a durable ledger. In-flight price
 changes and provider billing behavior are outside local reservation guarantees.
 
 ## Privacy and reply boundaries
@@ -288,3 +288,72 @@ unrefunded reservations, pricing failure without inference, authentication/confi
 shutdown, and increasing backoff bounded by the existing budget. No new live bot
 or paid inference was run for this change. Cumulative reservation remains
 $0.213136125 (not actual charged cost).
+
+## Best-effort supervised service
+
+The service uses a separate detached production worktree at
+`/workspace/apron-tab-ai-production`; development stays in `/workspace/apron-tab-ai`.
+The production checkout and its exact commit are recorded in a deployment manifest.
+Start/reconnect refuses a dirty or changed checkout. Editing development files does
+not hot-reload the running process. Only explicit stop, checkout, and deploy actions
+activate a tested update. Nothing changes or merges main.
+
+Persistent safe metadata lives in `/workspace/apron-service` (mode 0700): atomic
+`budget.json`, initialization marker, singleton/budget locks, pinned deployment,
+status, stop marker, and `metadata.log` (64 KiB with three rotated backups).
+No credentials, room/message IDs, chat messages, model replies, or reasoning text
+are saved. Credentials are inherited in memory from the configured environment;
+there is no environment file. Core dumps and library payload logging are disabled.
+
+Initial setup, once, from the clean tested production checkout:
+
+```sh
+python3 -B /workspace/apron-tab-ai-production/service.py init --seed 0.213136125
+python3 -B /workspace/apron-tab-ai-production/service.py start
+```
+
+Ongoing control:
+
+```sh
+python3 -B /workspace/apron-tab-ai-production/service.py status
+python3 -B /workspace/apron-tab-ai-production/service.py stop
+```
+
+The daemon holds a single-instance flock inherited by its worker; a second start
+fails. The worker watches its supervisor and terminates if orphaned. Stop sends
+SIGTERM, allows graceful cancellation, then bounds shutdown with the worker's
+five-second alarm and supervisor's seven-second kill deadline. Status reports PIDs,
+process-start ticks, pinned commit, readiness, safe counters, and cumulative
+reservation. Status from the ledger is authoritative; previous README totals are
+only checkpoints and must never reset a higher persisted value.
+
+Every paid request atomically reserves its full conservative cost and fsyncs the
+ledger before dispatch. There are no refunds. Concurrent updates are serialized;
+missing/corrupt ledgers and failed durable writes fail closed. Initialization cannot
+reset an existing service, even if its ledger was deleted. The $5 ceiling persists
+across reconnects, restarts, and deployments. Provider-side shared-key limits remain
+necessary for unrelated key usage. No balance or conversation-history export is made.
+
+Supervised mode removes the five-minute runtime and per-process call ceiling while
+retaining the finite $5 budget, 15-second rate spacing, context/output bounds, and
+32,768-token maximum generation allowance. API failures use the tested per-message
+backoff without retrying uncertain paid calls. Disconnects and transient startup
+faults restart a fresh connection with bounded 5–300 second backoff; auth/config,
+privacy, or budget failures halt. A greeting is claimed durably before its first
+send, so an ambiguous greeting or restart never loops greetings. Reconnects load
+recent same-room history and set a fresh cutoff without replaying prior triggers.
+If the server cannot provide a safe history cutoff, resume stops rather than guessing.
+
+The process is detached from the command session and will be checked from later
+commands and an agent turn. This is best-effort hosting: VM destruction or platform
+process cleanup can still stop it. No startup unit/cron or VM-recreation autostart is
+installed or promised. Restart requires the same valid ledger, deployment and
+configured credentials. For an explicit update: stop and confirm both PIDs are gone,
+check out the reviewed bot-branch commit in production, run its tests, then run
+`service.py deploy` and `service.py start`; the budget and hello marker are retained.
+
+Run synthetic service tests with `PYTHONDONTWRITEBYTECODE=1 python3 test_service.py -v`.
+They cover atomic budget updates, restart persistence, corruption/missing-ledger
+shutdown, concurrent ceiling enforcement, singleton inheritance, log filtering,
+transient worker restart, greeting suppression, replay exclusion, and graceful
+shutdown without a service runtime timer. No live network is used in these tests.
