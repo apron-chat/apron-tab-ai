@@ -20,7 +20,7 @@ def config(**changes):
 
 def message(ident="101", **changes):
     params = {"room_id": "test-room", "message_id": ident, "log_id": ident,
-              "from": {"user_id": "human"}, "body": {"text": "Synthetic test"}}
+              "from": {"user_id": "human"}, "body": {"text": "Synthetic test", "mentions": ["self"]}}
     params.update(changes)
     return {"method": "message", "params": params}
 
@@ -34,11 +34,11 @@ class PolicyTests(unittest.TestCase):
         env = dict(APRON_TOKEN="fake", DARKBLOOM_API_KEY="fake2",
                    DARKBLOOM_BASE_URL=bot.API_URL, APRON_ROOM_ID="test-room",
                    APRON_HUMAN_IDS="human", BOT_BUDGET_USD="0.10",
-                   BOT_PRIOR_SPEND_USD="0.000016125")
+                   BOT_PRIOR_SPEND_USD="0.039465725")
         self.assertEqual(bot.Config.from_env(env).runtime, 300)
         self.assertNotIn("fake", repr(bot.Config.from_env(env)))
         for key, bad in [("APRON_TOKEN", ""), ("BOT_BUDGET_USD", "5"),
-                         ("BOT_BUDGET_USD", "NaN"), ("BOT_PRIOR_SPEND_USD", "0"),
+                         ("BOT_BUDGET_USD", "NaN"), ("BOT_PRIOR_SPEND_USD", "0"), ("BOT_PRIOR_SPEND_USD", "0.000016125"),
                          ("BOT_MAX_RUNTIME_SECONDS", "999999"),
                          ("DARKBLOOM_BASE_URL", "https://invalid.example")]:
             with self.subTest(key=key), self.assertRaises(bot.Stop):
@@ -57,7 +57,7 @@ class PolicyTests(unittest.TestCase):
         cases = [{"from": {"user_id": "self"}}, {"from": {"user_id": "~server"}},
                  {"from": {"user_id": "human", "roles": ["bot"]}},
                  {"from": {"user_id": "unknown"}}, {"room_id": "other"},
-                 {"reply_to": {"message_id": "100"}}, {"deleted": True},
+                 {"deleted": True},
                  {"prev_room_id": "other"}, {"body": {"text": "hi", "embeds": [{}]}}]
         for i, case in enumerate(cases, 101):
             with self.subTest(case=case):
@@ -71,7 +71,7 @@ class PolicyTests(unittest.TestCase):
         c = bot.Config.from_env(dict(APRON_TOKEN="fake", DARKBLOOM_API_KEY="fake2",
                                      DARKBLOOM_BASE_URL=bot.API_URL))
         self.assertEqual(c.budget + c.prior_spend, Decimal("5"))
-        self.assertEqual(c.prior_spend, Decimal("0.000016125"))
+        self.assertEqual(c.prior_spend, Decimal("0.039465725"))
         self.assertEqual(c.room, "")
         self.assertFalse(c.humans)
 
@@ -90,21 +90,59 @@ class PolicyTests(unittest.TestCase):
 
     def test_public_mode_requires_structured_mention(self):
         self.p.config.humans = frozenset()
-        self.assertIsNone(self.p.accept(message("101")))
+        self.assertIsNone(self.p.accept(message("101", body={"text": "unmentioned"})))
         self.assertIsNone(self.p.accept(message("102", body={"text": "@self hi"})))
         self.assertIsNotNone(self.p.accept(message("103", body={"text": "Synthetic hi", "mentions": ["self"]})))
         self.assertIsNone(self.p.accept(message("104", body={"text": "hi", "mentions": ["self"]},
                                                **{"from": {"user_id": "anotherbot", "roles": ["bot"]}})))
 
-    def test_separate_bounded_history(self):
-        for _ in range(30):
-            self.p.remember("human", "a"*4000, "b"*1000)
-        history = self.p.messages("human", "c"*8000)
-        self.assertLessEqual(sum(len(m["content"].encode()) for m in history[1:]), 12000)
-        self.assertEqual(len(self.p.messages("other", "hi")), 2)
-        for i in range(30):
-            self.p.remember(str(i), "hi", "hello")
-        self.assertLessEqual(len(self.p.history), 16)
+    def test_room_context_order_dedup_and_no_future(self):
+        for ident, text in [("99", "earlier"), ("98", "oldest"), ("99", "duplicate")]:
+            self.p.observe(message(ident, body={"text": text})["params"])
+        self.assertIsNone(self.p.accept(message("100", body={"text": "ambient"})))
+        self.p.observe(message("105", body={"text": "future"})["params"])
+        self.assertIsNotNone(self.p.accept(message("101")))
+        context = self.p.messages("human", "trigger", "101")
+        self.assertEqual([m["content"] for m in context[1:]], ["oldest", "earlier", "ambient", "trigger"])
+        self.assertTrue(all(m["role"] == "user" for m in context[1:]))
+
+    def test_reply_to_bot_vs_other_and_unknown(self):
+        self.p.config.humans = frozenset()
+        self.p.observe(message("90", **{"from": {"user_id": "self"}}, body={"text": "bot turn"})["params"])
+        self.p.observe(message("91", body={"text": "other turn"})["params"])
+        for ident, target, accepted in [("101", "90", True), ("102", "91", False), ("103", "89", False)]:
+            frame = message(ident, body={"text": "reply"}, reply_to={"message_id": target})
+            self.assertEqual(self.p.accept(frame) is not None, accepted)
+        self.assertEqual(self.p.messages("human", "trigger", "101")[1]["role"], "assistant")
+        self.assertIsNone(self.p.accept(message("104", **{"from": {"user_id": "robot", "roles": ["bot"]}},
+                                                reply_to={"message_id": "90"})))
+
+    def test_history_isolation_and_limits(self):
+        other = bot.Policy(config(room="other"), Counter())
+        other.you = "self"
+        for i in range(1, 200):
+            snapshot = message(str(i), body={"text": "x"*1000})["params"]
+            self.p.observe(snapshot)
+            other.observe(snapshot)
+        self.assertFalse(other.history)
+        self.assertLessEqual(len(self.p.history), 64)
+        self.assertLessEqual(sum(len(row[2].encode()) for row in self.p.history.values()), 12000)
+        self.assertLessEqual(sum(len(m["content"].encode()) for m in self.p.messages("human", "x"*8000)[1:]), 12000)
+        self.p.observe(message("200", body={"text": "synthetic-api-secret"})["params"])
+        self.assertNotIn("synthetic-api-secret", str(self.p.history))
+        self.p.observe(message("201", body={"text": "x"*8001})["params"])
+        self.assertFalse(self.p.history[201][2])
+
+    def test_history_edits_deletion_and_move(self):
+        self.p.observe(message("90", body={"text": "original"})["params"])
+        self.p.observe(message("90", log_id="91", body={"text": "edited"})["params"])
+        self.p.observe(message("90", body={"text": "stale"})["params"])
+        self.assertEqual(self.p.history[90][2], "edited")
+        self.p.observe(message("90", log_id="92", deleted=True)["params"])
+        self.assertFalse(self.p.history[90][2])
+        self.p.observe(message("93")["params"])
+        self.p.observe(message("93", room_id="other", prev_room_id="test-room")["params"])
+        self.assertNotIn(93, self.p.history)
 
     def test_reservation_and_call_ceiling(self):
         self.p.reserve(Decimal("0.06"), 1)
@@ -120,13 +158,14 @@ class PolicyTests(unittest.TestCase):
         api = bot.Darkbloom(config())
         with patch.object(api, "request", return_value={"prices": [
                 {"model": bot.MODEL, "input_usd": "$0.0750", "output_usd": "$0.5000"}]}):
-            self.assertEqual(api.reservation(), Decimal("0.0197248"))
+            self.assertEqual(api.reservation(), Decimal("0.0199168"))
         response = {"model": bot.MODEL, "choices": [{"message": {"content": "Synthetic reply"}}]}
         with patch.object(api, "request", return_value=response) as request:
             self.assertEqual(api.complete(self.p.messages("human", "hi")), "Synthetic reply")
             payload = request.call_args.args[1]
             self.assertEqual(set(payload), {"model", "messages", "stream", "max_tokens"})
             self.assertFalse(payload["stream"])
+            self.assertEqual(payload["max_tokens"], 512)
             self.assertNotIn("synthetic-api-secret", json.dumps(payload))
         for text in ("synthetic-api-secret", "synthetic-apron-secret", ""):
             response["choices"][0]["message"]["content"] = text
@@ -138,6 +177,25 @@ class PolicyTests(unittest.TestCase):
         response["choices"][0]["message"]["tool_calls"] = [{"name": "shell"}]
         with patch.object(api, "request", return_value=response), self.assertRaises(bot.Stop):
             api.complete([])
+
+    def test_output_diagnostics_are_allowlisted(self):
+        api = bot.Darkbloom(config())
+        result = {"model": bot.MODEL, "choices": [{"finish_reason": "length", "message": {"content": ""}}],
+                  "usage": {"completion_tokens_details": {"reasoning_tokens": 128}}}
+        output = io.StringIO()
+        with patch.object(api, "request", return_value=result), redirect_stdout(output):
+            with self.assertRaisesRegex(bot.Stop, "^model_output_empty_or_nontext$"):
+                api.complete([])
+        record = json.loads(output.getvalue())
+        self.assertEqual(record, {"status": "model_output_metadata", "finish_reason": "length",
+            "content_type": "text", "content_nonempty": False, "output_length": 0, "reasoning_tokens": 128})
+        result["choices"][0] = {"finish_reason": "synthetic-private", "message": {"content": "synthetic-api-secret"}}
+        output = io.StringIO()
+        with patch.object(api, "request", return_value=result), redirect_stdout(output):
+            with self.assertRaisesRegex(bot.Stop, "^model_output_secret_guard$"):
+                api.complete([])
+        self.assertNotIn("synthetic", output.getvalue())
+        self.assertEqual(json.loads(output.getvalue())["finish_reason"], "unknown")
 
     def test_sanitized_failure_no_retry_no_redirect(self):
         api = bot.Darkbloom(config())
@@ -281,6 +339,44 @@ class SessionTests(unittest.IsolatedAsyncioTestCase):
             self.assertEqual(session.policy.reserved, Decimal("0.02"))
             self.assertEqual(session.stats["replies"], 0)
 
+    async def test_history_bootstrap_no_replay_trigger_and_reply_resolution(self):
+        class HistorySocket(FakeSocket):
+            async def send(self, raw):
+                frame = json.loads(raw)
+                if frame["method"] != "history":
+                    return await super().send(raw)
+                self.sent.append(frame)
+                if "after" in frame["params"]:
+                    rows = [message("50", **{"from": {"user_id": "self"}}, body={"text": "old bot turn"})["params"]]
+                else:
+                    rows = [message("80", body={"text": "room background"})["params"],
+                            message("81", room_id="other")["params"], message("82")["params"]]
+                self.incoming.put_nowait(json.dumps({"id": frame["id"], "result": {"messages": rows}}))
+        socket, api = HistorySocket(), FakeAPI()
+        socket.incoming.get_nowait()
+        socket.incoming.put_nowait(json.dumps({"method": "server", "params": {
+            "apron": 8, "auth": ["token"], "capabilities": ["rooms", "history"]}}))
+        session = bot.Session(socket, config(), api)
+        task = asyncio.create_task(session.run())
+        try:
+            await self.until(lambda: session.stats["ready"])
+            self.assertFalse(api.calls)
+            self.assertEqual(session.stats["history_loaded"], 1)
+            self.assertNotIn(81, session.policy.history)
+            socket.incoming.put_nowait(json.dumps(message("101", body={"text": "reply trigger"}, reply_to={"message_id": "50"})))
+            await self.until(lambda: session.stats["replies"] == 1)
+            self.assertEqual(session.stats["reply_lookups"], 1)
+            context = api.calls[0]
+            self.assertIn({"role": "user", "content": "room background"}, context)
+            self.assertIn({"role": "assistant", "content": "old bot turn"}, context)
+            self.assertEqual(context[-1], {"role": "user", "content": "reply trigger"})
+            self.assertEqual(sum(m["content"] == "reply trigger" for m in context), 1)
+        finally:
+            task.cancel()
+            await asyncio.gather(task, return_exceptions=True)
+        self.assertFalse(session.policy.history)
+        self.assertFalse(session.resolvers)
+
     async def test_runtime_and_operator_stop(self):
         class FakeConnect:
             def __init__(self, *args, **kwargs):
@@ -318,5 +414,5 @@ class SessionTests(unittest.IsolatedAsyncioTestCase):
 
 
 if __name__ == "__main__":
-    with patch("socket.socket.connect", side_effect=AssertionError("Network prohibited in tests")):
+    with patch("socket.socket.connect", side_effect=AssertionError("Network prohibited in tests")), redirect_stdout(io.StringIO()):
         unittest.main()
