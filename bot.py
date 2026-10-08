@@ -16,6 +16,7 @@ import time
 import urllib.error
 import urllib.request
 import uuid
+import safe_fetch
 
 APRON_URL = "wss://server.apron.chat/"
 API_URL = "https://api.darkbloom.dev/v1"
@@ -92,6 +93,8 @@ class Config:
     prior_spend: Decimal = KNOWN_PRIOR_RESERVATION_USD
     ledger: object = field(default=None, repr=False)
     service_mode: bool = False
+    # Candidate allowlist requires explicit operator enablement; production off.
+    fetch_enabled: bool = False
 
     @classmethod
     def from_env(cls, env):
@@ -121,8 +124,11 @@ class Config:
         humans = frozenset(x.strip() for x in env.get("APRON_HUMAN_IDS", "").split(",") if x.strip())
         if len(humans) > 16 or any(x.startswith("~") for x in humans):
             raise Stop("human_allowlist_invalid")
+        if env.get("BOT_RESTRICTED_FETCH", "0") not in {"0", "1"}:
+            raise Stop("configuration_invalid")
         return cls(token, env["DARKBLOOM_API_KEY"],
-                   env.get("APRON_ROOM_ID", ""), humans, budget, runtime, interval, calls, prior)
+                   env.get("APRON_ROOM_ID", ""), humans, budget, runtime, interval, calls, prior,
+                   fetch_enabled=env.get("BOT_RESTRICTED_FETCH") == "1")
 
 
 def log_id(value):
@@ -730,8 +736,13 @@ class Session:
                 self.stats["rate_dropped"] += 1
                 continue
             try:
-                if getattr(context, "fixed_reply", None):
-                    reply = context.fixed_reply
+                fixed_reply = getattr(context, "fixed_reply", None)
+                participant_lookup = getattr(context, "participant_lookup", False)
+                if self.config.fetch_enabled and not fixed_reply:
+                    context, fixed_reply = await asyncio.to_thread(
+                        safe_fetch.enrich, context, text, (self.config.token, self.config.api_key))
+                if fixed_reply:
+                    reply = fixed_reply
                     self.policy.next_call = time.monotonic() + self.config.interval
                     self.stats["reference_failures"] += 1
                 else:
@@ -740,7 +751,7 @@ class Session:
                     self.stats["calls"] += 1
                     self.report("call_reserved", self)
                     reply = await asyncio.to_thread(self.api.complete, context)
-                    if getattr(context, "participant_lookup", False) and reply != INCOMPLETE_REPLY:
+                    if participant_lookup and reply != INCOMPLETE_REPLY:
                         reply = bounded_reply("From the recent room history I can see: " + reply)
             except ApiFailure as failure:
                 if not failure.transient:

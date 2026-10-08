@@ -110,6 +110,55 @@ hosting is not promised. Persistent operation needs a separately approved host.
 
 ## Fixed network and spending boundaries
 
+### Candidate restricted page fetching (disabled, not deployed)
+
+`BOT_RESTRICTED_FETCH` defaults to `0`. Setting it to `1` enables the candidate
+fetcher after operator approval of the exact site scope. This is not general web
+search or arbitrary URL access. No search account/key is needed.
+
+Only an explicit, verbatim HTTPS URL in the triggering participant's message can
+cause a request. Prior room messages, model replies and retrieved page contents
+cannot cause requests. Exactly one URL is accepted; surrounding punctuation is
+not repaired. Fragments are removed. All query strings, userinfo, ports, IP
+literals, non-ASCII/encoded paths, off-list hosts and redirects are rejected.
+
+The sole candidate host is **docs.python.org**, restricted to `/3/library/`,
+`/3/tutorial/` and `/3/reference/` paths ending in `.html`, with narrowly validated
+path characters. For example, `https://docs.python.org/3/library/colorsys.html`.
+No Wikipedia host is currently enabled: the trial article failed the bounded
+fetch probe. Adding destinations requires a reviewed code change and approval.
+
+The managed proxy resolves destinations and its public-IP enforcement is not
+documented in this workspace. Therefore generic fetching is intentionally absent.
+The design instead relies on fixed trusted provider routes, HTTPS certificate
+verification, no redirects, and the existing proxy policy. It does not claim that
+a local DNS check protects proxy-side resolution or defeat the managed proxy.
+
+A separate credential-free child process performs the request using only existing
+proxy/TLS environment settings. It has a 12-second wall-clock kill deadline and a
+10-second network/read deadline. Only HTTP 200 HTML/plain text is accepted, with a
+64 KiB response cap. Compression is rejected entirely (identity encoding only),
+so no decompression expansion occurs. HTML is parsed without a browser; scripts,
+styles and common hidden elements are omitted and no subresources are fetched.
+At most 6 KiB of printable plain-text excerpt is passed to Darkbloom in an untrusted
+user-role evidence message before the unchanged original request. The system
+instructions explicitly distinguish page evidence from instructions. This reduces
+capability risk but does not guarantee that the model ignores all prompt injection.
+
+No bot credentials, cookies, room history or question text are included in the
+page request. The remote site sees the explicit URL, identifying User-Agent and
+network metadata. Page excerpts go only to the existing Darkbloom integration.
+No queries, URLs, excerpts or remote errors enter logs or disk history. A rejected
+fetch gets a static response without model spend. A successful fetch retains the
+existing one-completion reservation and cumulative $5 durable ledger. Fetches use
+the existing serial trigger processing and inference interval; there are no
+automatic retries or native model tool calls.
+
+Synthetic validation: `python3 -B -m unittest discover -q`. The fixed Python docs
+probe returned a 2,692-byte sanitized excerpt; only success/count metadata was
+printed. No real conversation or model response was inspected. Production remains
+on its previous commit until the narrowed destination scope is approved.
+
 Endpoints and model are fixed in code: `wss://server.apron.chat/`, Darkbloom's
 `/v1/pricing` and `/v1/chat/completions`, and `ternary-bonsai-2-27b`. No redirects
 are followed. Host-managed egress proxies are respected; HTTPS/WSS still verify
