@@ -110,6 +110,93 @@ hosting is not promised. Persistent operation needs a separately approved host.
 
 ## Fixed network and spending boundaries
 
+### Room organization (development only, disabled without owner and room IDs)
+
+The development branch includes a deterministic organizer separate from the LLM.
+Nothing has been enabled or deployed to the production service. Configure both
+`BOT_ORGANIZER_OWNER_IDS` and `BOT_ORGANIZER_ROOM_IDS` as comma-separated exact
+server IDs to enable it for those callers and source rooms. Both default empty.
+Caller identity comes from the fresh server-authenticated message's `from.user_id`,
+not names, quoted text or model output. The normal bot mention/reply, replay and
+human filters still apply (`APRON_HUMAN_IDS`, if configured, must admit the owner).
+
+Supported direct requests in the selected bot room:
+
+- `/thread <topic>` or `thread the discussion about <topic>`
+- `/summary [focus]` or `update the summary of this room` (also `thread`)
+- `/confirm <preview-code>` from the same authorized caller in the same room
+
+These are bot message texts, not an unrestricted protocol command interface.
+The first two read at most three history pages of 50 changes and 32 KiB of JSON.
+They reconstruct current snapshots, ignore deleted/moved-out records and messages
+created at or after the triggering command, then ask the existing Darkbloom model
+for a strict JSON plan. Selection uses only supplied IDs, up to eight messages,
+an 80-character title and 300-character summary. The one planning completion uses
+the existing atomic durable reservation and $5 cumulative ceiling. Invalid output
+fails closed; there is no inference retry or native model tool execution.
+
+Every plan previews its selected IDs, title and summary. It has no side effects
+until the same caller confirms within three minutes. Only one pending plan is
+kept in memory; a new request replaces it and a restart loses it. Confirmation is
+consumed before writing and cannot be replayed. History instructions cannot grant
+authority or choose methods/destinations. URLs in organization requests are not
+fetched. The independent restricted-fetch feature remains disabled.
+
+The executor rechecks room/message snapshots, creates a child with `room_set`,
+validates the returned child, and sequentially moves selected messages with
+`message`, preserving their body (including mentions/embeds), reply reference,
+ext and deletion state. IDs/authors are preserved by the server. Summary updates
+resubmit the existing title and other room client fields. Source rooms must be
+explicitly allowed and public. The current single-room bot does not automatically
+subscribe to a created child: requests to update that child's summary require a
+bot session selected/configured for that room.
+
+By default moves are limited to the bot's own messages. To request other-author
+moves additionally requires `BOT_ORGANIZER_ALLOW_OTHER_AUTHORS=1` and a verified
+bot `mod`/`admin` role, and the server must actually permit it. These local checks
+do not grant permissions. All server denials are final; no account/role changes
+are made by the bot.
+
+There is no transactional multi-message move or compare-and-swap in the protocol.
+Preflight/rechecks catch observed edits but cannot eliminate the read/write race.
+If an operation fails, the executor stops and reports the confirmed move count
+and any created thread. A timeout can mean the last write succeeded, so it is not
+automatically retried or rolled back. No automatic undo is implemented, and no
+content-bearing recovery journal is persisted. Server quotas may stop a batch.
+
+#### Actual local Go server verification
+
+Verified the official `apron-chat/apron-server-go` repository at commit
+`067083815be6b113e7d35f6569fa35dee0052fd5`, Apron protocol 8, built using the
+official checksum-verified Go 1.27.1 toolchain. The server ran unmodified on
+127.0.0.1 with `--store memory`, synthetic guest identities, an environment without
+production credentials, and discarded server logs. Each test shut its server down.
+
+Run the full suite including real-server integration with:
+
+```sh
+APRON_GO_BINARY=/absolute/path/to/aprond python3 -B -m unittest discover -q
+```
+
+Without `APRON_GO_BINARY`, only the three real-server tests are skipped. The
+verified suite has 89 tests. Integration covers actual authenticated caller
+metadata, topic-fixture selection, thread creation, moving bot-authored messages,
+client-field/author preservation, unrelated messages left in place, both general
+and thread summaries with titles preserved, other-author move denial (-32001),
+unauthorized confirmation, conflicting edits, and a partial batch stopped after
+one confirmed move. Unit tests additionally cover pagination, invalid plans,
+injection evidence, credentials, bounded history, expiry/replay and reservations.
+The planner was a deterministic synthetic fixture; no paid model calls were made.
+Real model selection quality remains subject to the visible confirmation preview.
+
+**Server differences:** this Go revision allows any authenticated visible-room
+edit, including `general`, and nested threads. But edits/moves require the original
+author identity; moderator roles do not override that check. Therefore re-threading
+other people's messages cannot succeed on this unmodified Go revision merely by
+granting a role. The public Cloudflare implementation allows `mod`/`admin` to move
+other authors' unchanged messages, but forbids editing `general` and nesting
+threads. Do not infer production permissions from the local success cases.
+
 ### Candidate restricted page fetching (disabled, not deployed)
 
 `BOT_RESTRICTED_FETCH` defaults to `0`. Setting it to `1` enables the candidate

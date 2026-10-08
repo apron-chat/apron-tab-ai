@@ -17,6 +17,7 @@ import urllib.error
 import urllib.request
 import uuid
 import safe_fetch
+import organizer
 
 APRON_URL = "wss://server.apron.chat/"
 API_URL = "https://api.darkbloom.dev/v1"
@@ -95,6 +96,9 @@ class Config:
     service_mode: bool = False
     # Candidate allowlist requires explicit operator enablement; production off.
     fetch_enabled: bool = False
+    organizer_owners: frozenset = frozenset()
+    organizer_rooms: frozenset = frozenset()
+    organizer_allow_others: bool = False
 
     @classmethod
     def from_env(cls, env):
@@ -126,9 +130,19 @@ class Config:
             raise Stop("human_allowlist_invalid")
         if env.get("BOT_RESTRICTED_FETCH", "0") not in {"0", "1"}:
             raise Stop("configuration_invalid")
+        def ids(key):
+            values = frozenset(x.strip() for x in env.get(key, '').split(',') if x.strip())
+            if len(values) > 16 or any(len(x) > 128 or x.startswith('~') or not re.fullmatch(r'[A-Za-z0-9_.@-]+', x) for x in values):
+                raise Stop('configuration_invalid')
+            return values
+        if env.get('BOT_ORGANIZER_ALLOW_OTHER_AUTHORS', '0') not in {'0', '1'}:
+            raise Stop('configuration_invalid')
         return cls(token, env["DARKBLOOM_API_KEY"],
                    env.get("APRON_ROOM_ID", ""), humans, budget, runtime, interval, calls, prior,
-                   fetch_enabled=env.get("BOT_RESTRICTED_FETCH") == "1")
+                   fetch_enabled=env.get("BOT_RESTRICTED_FETCH") == "1",
+                   organizer_owners=ids('BOT_ORGANIZER_OWNER_IDS'),
+                   organizer_rooms=ids('BOT_ORGANIZER_ROOM_IDS'),
+                   organizer_allow_others=env.get('BOT_ORGANIZER_ALLOW_OTHER_AUTHORS') == '1')
 
 
 def log_id(value):
@@ -576,6 +590,17 @@ class Session:
         self.next_lookup = 0.0
         self.api_failure_streak = 0
         self.report = report or (lambda status, session: None)
+        self.roles = frozenset()
+        self.organizer = organizer.Organizer(self.rpc, self.organization_plan,
+            config.organizer_owners, config.organizer_rooms, config.organizer_allow_others,
+            (config.token, config.api_key))
+
+    async def organization_plan(self, messages):
+        amount = await asyncio.to_thread(self.api.reservation)
+        self.policy.reserve(amount, time.monotonic())
+        self.stats['calls'] += 1
+        self.report('call_reserved', self)
+        return await asyncio.to_thread(self.api.complete, messages)
 
     async def rpc(self, method, params):
         ident = uuid.uuid4().hex
@@ -620,10 +645,13 @@ class Session:
                 if frame["params"]["you"].get("user_id") != self.policy.you:
                     raise Stop("identity_changed")
                 self.policy.remember_identity(frame["params"]["you"], current=True)
+                self.roles = frozenset(x for x in frame['params']['you'].get('roles', []) if isinstance(x, str))
             if frame.get("method") == "user":
                 p = frame.get("params", {})
                 if isinstance(p, dict):
                     updated = p.get("new")
+                    if isinstance(updated, dict) and updated.get('user_id') == self.policy.you and 'roles' in updated:
+                        self.roles = frozenset(x for x in updated.get('roles', []) if isinstance(x, str))
                     if isinstance(updated, dict) and updated.get("user_id") in self.policy.identities:
                         self.policy.remember_identity(updated, current=True)
             if frame.get("method") == "room_update":
@@ -732,13 +760,19 @@ class Session:
         while True:
             user, ident, text, context = await self.queue.get()
             now = time.monotonic()
-            if now < self.policy.next_call:
+            org_command = organizer.command(text)
+            confirmation = (org_command and org_command[0] == 'confirm'
+                            and user in self.config.organizer_owners)
+            if now < self.policy.next_call and not confirmation:
                 self.stats["rate_dropped"] += 1
                 continue
             try:
                 fixed_reply = getattr(context, "fixed_reply", None)
                 participant_lookup = getattr(context, "participant_lookup", False)
-                if self.config.fetch_enabled and not fixed_reply:
+                if org_command:
+                    fixed_reply = await self.organizer.handle(user, self.config.room, text, ident,
+                        self.policy.you, self.roles, (self.server or {}).get('capabilities', []))
+                elif self.config.fetch_enabled and not fixed_reply:
                     context, fixed_reply = await asyncio.to_thread(
                         safe_fetch.enrich, context, text, (self.config.token, self.config.api_key))
                 if fixed_reply:
@@ -789,6 +823,7 @@ class Session:
         if not isinstance(self.policy.you, str) or not self.policy.you:
             raise Stop("authentication_failed")
         self.policy.remember_identity(auth.get("you"), current=True)
+        self.roles = frozenset(x for x in auth.get('you', {}).get('roles', []) if isinstance(x, str))
         self.stats["authenticated"] = 1
         # A rotated token is never printed or persisted; this process never reconnects.
         if auth.get("token"):
