@@ -172,14 +172,14 @@ class PolicyTests(unittest.TestCase):
         api = bot.Darkbloom(config())
         with patch.object(api, "request", return_value={"prices": [
                 {"model": bot.MODEL, "input_usd": "$0.0750", "output_usd": "$0.5000"}]}):
-            self.assertEqual(api.reservation(), Decimal("0.0217088"))
+            self.assertEqual(api.reservation(), Decimal("0.0360448"))
         response = {"model": bot.MODEL, "choices": [{"finish_reason": "stop", "message": {"content": "Synthetic reply"}}]}
         with patch.object(api, "request", return_value=response) as request:
             self.assertEqual(api.complete(self.p.messages("human", "hi")), "Synthetic reply")
             payload = request.call_args.args[1]
             self.assertEqual(set(payload), {"model", "messages", "stream", "max_tokens"})
             self.assertFalse(payload["stream"])
-            self.assertEqual(payload["max_tokens"], 4096)
+            self.assertEqual(payload["max_tokens"], 32768)
             self.assertNotIn("synthetic-api-secret", json.dumps(payload))
         for text in ("synthetic-api-secret", "synthetic-apron-secret"):
             response["choices"][0]["message"]["content"] = text
@@ -261,6 +261,15 @@ class PolicyTests(unittest.TestCase):
     def test_later_edit_not_in_earlier_trigger_context(self):
         self.p.observe(message("90", log_id="110", body={"text": "future edit"})["params"])
         self.assertNotIn("future edit", json.dumps(self.p.messages("human", "trigger", "101")))
+
+    def test_completion_timeout_is_bounded_and_pricing_stays_short(self):
+        api = bot.Darkbloom(config())
+        for path, payload, timeout in [("/pricing", None, 30), ("/chat/completions", {}, 120)]:
+            with patch.object(api.opener, "open", side_effect=TimeoutError()) as request:
+                with self.assertRaisesRegex(bot.Stop, "^api_request_failed$"):
+                    api.request(path, payload)
+                self.assertEqual(request.call_args.kwargs["timeout"], timeout)
+                request.assert_called_once()
 
     def test_sanitized_failure_no_retry_no_redirect(self):
         api = bot.Darkbloom(config())

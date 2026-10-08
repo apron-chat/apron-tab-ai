@@ -48,7 +48,7 @@ variables and never generates or rotates credentials.
 | `APRON_ROOM_ID` | Optional; needed only if joined-room metadata is ambiguous |
 | `APRON_HUMAN_IDS` | Optional sender restriction, maximum 16; mentions/replies still required |
 | `BOT_BUDGET_USD` | Optional lower budget; defaults to $5 minus prior reservation |
-| `BOT_PRIOR_SPEND_USD` | Defaults to cumulative reservation `0.126300925`; cannot be lowered; update after later runs |
+| `BOT_PRIOR_SPEND_USD` | Defaults to cumulative reservation `0.213136125`; cannot be lowered; update after later runs |
 | `BOT_MAX_RUNTIME_SECONDS` | Default 300; allowed 1–600 |
 | `BOT_MIN_INTERVAL_SECONDS` | Default 15; minimum 10 between inference starts |
 | `BOT_MAX_CALLS` | Default 10; maximum 20 per process |
@@ -123,9 +123,9 @@ the bot cannot enforce shared-key spending by other processes.
 
 Before the startup hello and each completion, public model pricing is checked.
 Unavailable or invalid pricing stops the session. Each attempt reserves the
-price of the **entire 262,144-token context plus 4,096 generation tokens**, even though
+price of the **entire 262,144-token context plus 32,768 generation tokens**, even though
 inputs are much smaller. At verified rates of $0.075/$0.50 per million input/output
-tokens, this is $0.0217088 per attempt. Reservations are never refunded, even on
+tokens, this is $0.0360448 per attempt. Reservations are never refunded, even on
 errors, timeouts, or uncertain outcomes. There are no inference retries, automatic
 reconnects, or balance/usage-history queries.
 
@@ -148,7 +148,7 @@ Only text is sent to Darkbloom: no names, IDs, room descriptions, attachments,
 embedded messages, credentials, or assistant personal context. Context is scoped to the single selected room, at most 64 snapshots and
 12,000 UTF-8 bytes total. A separate bounded index retains up to 128 own message
 IDs for reply routing. Other participants use the user role with anonymous labels; only this bot uses
-the assistant role. Conversation text cannot supply system instructions. Inputs are capped at 8,000 bytes; generation at 4,096 tokens including reasoning and posted outputs at
+the assistant role. Conversation text cannot supply system instructions. Inputs are capped at 8,000 bytes; generation at 32,768 tokens including reasoning and posted outputs at
 1,000 characters. Complete overlong answers end at a sentence boundary with an
 explicit shortening marker; if no complete sentence fits, a fixed helpful notice
 is used. Length-stopped or empty completions always produce a fixed failure
@@ -218,9 +218,34 @@ marked earlier reference immediately before the trigger. All four requests
 finished with `stop`; the 4,096-token request parameter was accepted. These small
 checks do not guarantee response quality for every conversation.
 
-**Next-run default and minimum cumulative reservation: $0.126300925.**
-This includes the initial estimate, both earlier live attempts, and four
-synthetic API calls conservatively reserved at $0.0217088 each. It is a
-**reservation, not actual charged cost**. The remaining ceiling is $4.873699075.
-Use `BOT_PRIOR_SPEND_USD=0.126300925` or a higher up-to-date total after any
-additional key use. No live bot session has run with these final fixes.
+**Next-run default and minimum cumulative reservation: $0.213136125.**
+This includes the initial estimate, earlier live attempts, four synthetic API
+checks, and the latest live session. It is a **reservation, not actual charged
+cost**. The remaining ceiling is $4.786863875. Use
+`BOT_PRIOR_SPEND_USD=0.213136125` or a higher up-to-date total after further key use.
+
+The latest live session started at 01:33:09 UTC on 2026-10-08 with 4,096 tokens.
+It confirmed authentication, room history, and hello, then stopped at approximately
+01:34:57 UTC with sanitized `api_request_failed`: four eligible messages, four
+inference attempts, three acknowledged replies. The final attempt remains fully
+reserved. The sanitized error does not identify a timeout versus another transport
+or HTTP failure. No automatic retry or reconnect was attempted.
+
+## Verified maximum for the next run
+
+An authenticated read of the official `https://api.darkbloom.dev/v1/models`
+endpoint on 2026-10-08 reported `max_output_length: 32768` and
+`context_length: 262144` for `ternary-bonsai-2-27b`. These are separate limits;
+the context window is not used as the output allowance. The next-run configuration
+now requests 32,768 generation tokens, retains the concise-response instruction,
+and conservatively reserves $0.0360448 per attempt at the verified rates.
+The [model-list documentation](https://docs.darkbloom.dev/api/models) describes
+this discovery endpoint; [chat-completion documentation](https://docs.darkbloom.dev/api/chat-completions)
+describes `max_tokens` and its separate 8,192-token default when omitted.
+
+Completion HTTP timeout is now 120 seconds (pricing remains 30 seconds), with
+no retries. The session's existing runtime and hard shutdown still apply; a high
+token ceiling does not guarantee a full 32,768-token generation before those time
+limits. Responses remain bounded and length-stopped fragments are never posted.
+The 32,768 configuration and timeout passed synthetic tests only; no paid maximum-
+size probe or new live session was started. Thirty-one regression tests pass.

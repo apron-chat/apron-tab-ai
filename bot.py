@@ -20,12 +20,14 @@ API_URL = "https://api.darkbloom.dev/v1"
 MODEL = "ternary-bonsai-2-27b"
 CONTEXT_TOKENS = 262144
 # Allow reasoning tokens while retaining the 1,000-character posted-reply cap.
-OUTPUT_TOKENS = 4096
+# Darkbloom /v1/models max_output_length, verified 2026-10-08.
+OUTPUT_TOKENS = 32768
+COMPLETION_TIMEOUT_SECONDS = 120
 MAX_INPUT_BYTES = 8000
 MAX_HISTORY_BYTES = 12000
 MAX_OUTPUT_CHARS = 1000
 # Conservative cumulative reservation from completed runs, not actual billing.
-KNOWN_PRIOR_RESERVATION_USD = Decimal("0.126300925")
+KNOWN_PRIOR_RESERVATION_USD = Decimal("0.213136125")
 INCOMPLETE_REPLY = "I couldn't finish a complete answer within this request's limit. Please try a shorter or more specific question."
 HELLO = "Hello! I'm a chat-testing bot. My responses use Darkbloom AI."
 SYSTEM = (
@@ -126,7 +128,7 @@ class Darkbloom:
                             "Authorization": "Bearer " + self.config.api_key})
         request = urllib.request.Request(API_URL + path, data=data, headers=headers)
         try:
-            with self.opener.open(request, timeout=30) as response:
+            with self.opener.open(request, timeout=COMPLETION_TIMEOUT_SECONDS if payload is not None else 30) as response:
                 body = response.read(262145)
                 if len(body) > 262144:
                     raise Stop("api_response_too_large")
