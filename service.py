@@ -44,7 +44,7 @@ EVENTS = RESTARTABLE | {
 COUNTS = {'authenticated', 'room_selected', 'history_loaded', 'hello_acknowledged',
           'ready', 'eligible', 'calls', 'replies', 'rate_dropped', 'dropped',
           'reply_lookups', 'reply_lookup_failed', 'api_failures', 'backoff_seconds',
-          'backoff_dropped', 'token_rotation', 'joined_rooms'}
+          'backoff_dropped', 'token_rotation', 'joined_rooms', 'reference_failures', 'participant_metadata_unavailable'}
 
 
 def atomic_json(path, data):

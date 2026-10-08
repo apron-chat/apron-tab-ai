@@ -17,7 +17,8 @@ Context includes non-trigger messages and the bot's own messages from the select
 room, in chronological order, deduplicated by message ID and latest snapshot.
 A referenced reply target appears once, explicitly marked as an earlier message,
 immediately before the trigger so it is not buried or evicted by ambient context.
-Anonymous participant labels distinguish senders without sending real IDs/names.
+Anonymous participant labels distinguish senders without sending metadata names or real IDs. Participant references already
+present in the question can be linked to those anonymous labels as user-role data.
 Each queued request freezes its bounded context; later edits cannot change it.
 At startup, capability `history` permits one recent same-room page (64 records).
 History ingestion never triggers responses. Without history support, context is
@@ -357,3 +358,42 @@ They cover atomic budget updates, restart persistence, corruption/missing-ledger
 shutdown, concurrent ceiling enforcement, singleton inheritance, log filtering,
 transient worker restart, greeting suppression, replay exclusion, and graceful
 shutdown without a service runtime timer. No live network is used in these tests.
+
+## Participant references in questions
+
+The bot now resolves structured mentions to stable participant IDs inside its
+runtime, excluding its own mention from the target list. A selected-room-only
+`room_list` request with `members: true`, same-room message authors, and updates
+to already-known participants provide a bounded identity index (128 participants).
+Handle/display-name matching is a fallback for references in a question that has
+already triggered the bot; plain text never becomes a notification trigger.
+Structured mention IDs disambiguate duplicate labels and take priority over
+another user's coincidentally matching handle. Ambiguous or unknown references
+produce a direct clarification rather than a room-wide summary.
+
+For up to four resolved participants, the bot selects the latest retained earlier
+text by stable author ID and creation order, excluding deleted messages, future
+edits, the current trigger, and other rooms. These messages are pinned near the
+question, exactly once, before trimming unrelated context. Identity resolution and
+payload selection happen inside the bot only. Participant IDs and metadata names
+are not sent as system instructions; only anonymous labels, references already in
+the user's question, and relevant room text enter user/assistant roles. Malformed
+or instruction-like metadata is never promoted into the system prompt.
+
+The final answer includes a recent-history caveat. Missing participant history
+produces a fixed explanation without an LLM call; there is no claim to cover all
+past messages. Long/ambiguous selections fail clearly within the existing context
+limit. No extra model tools, cross-room lookups, or private-context sources exist.
+
+Sixty synthetic tests cover prior safeguards plus multi-author mentions, matching
+handle collisions, ambiguous names, unknown members, members with no text,
+ordering, history limits, cross-room exclusion, malicious names, and static
+no-inference failure responses. Two fictional-input API checks returned the correct
+single-author and multi-author latest topics. Their reservations used the existing
+atomic service ledger alongside production, never a separate budget. At the last
+checkpoint its total was $0.357315325; this is not a charged-cost claim and the
+live ledger remains authoritative as the service continues.
+
+Development stays separate from the running production checkout until the tested
+commit is promoted with stop/deploy/start. The existing ledger and greeting claim
+are preserved, so deployment does not reset spending or post another greeting.

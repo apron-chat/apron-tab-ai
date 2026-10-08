@@ -391,8 +391,8 @@ class SessionTests(unittest.IsolatedAsyncioTestCase):
                 await asyncio.gather(task, return_exceptions=True)
         self.assertEqual(output.getvalue(), "")
         self.assertEqual(len(api.calls), 1)
-        self.assertEqual([f["method"] for f in socket.sent], ["auth", "room_list", "message", "message"])
-        self.assertEqual(socket.sent[2]["params"]["body"]["text"], bot.HELLO)
+        self.assertEqual([f["method"] for f in socket.sent], ["auth", "room_list", "room_list", "message", "message"])
+        self.assertEqual(socket.sent[3]["params"]["body"]["text"], bot.HELLO)
         self.assertEqual(socket.sent[-1]["params"]["reply_to"], {"message_id": "101"})
         self.assertFalse(session.policy.history)
 
