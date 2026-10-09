@@ -397,3 +397,64 @@ live ledger remains authoritative as the service continues.
 Development stays separate from the running production checkout until the tested
 commit is promoted with stop/deploy/start. The existing ledger and greeting claim
 are preserved, so deployment does not reset spending or post another greeting.
+
+## Operational diagnosis and startup follow-ups
+
+The service writes allowlisted operational events to
+`/workspace/apron-service/metadata.log` (64 KiB, three rotated backups). Each event
+has UTC epoch seconds, monotonic milliseconds and a numeric supervisor boot ID.
+Lifecycle events include worker process/start identities and boot IDs, exit code
+and signal, restart reason/backoff, catchable shutdown signals, WebSocket numeric
+close/handshake codes, classified API failures, and 30-second heartbeats with
+bounded process CPU/max-RSS metadata. No close reason, exception string, URL,
+header, credential, message, model response or history text is logged. Unknown
+keys and values are discarded before disk writes. Events are flushed and fsynced.
+
+`status.json` is atomic; `lifecycle.json` records a running/clean-exit marker.
+`status` checks PID start ticks, reports stale metadata after 90 seconds, and never
+labels dead/stale processes ready. A missing clean exit is reported as
+`unknown_abrupt_stop_environment_loss_possible`, not as proof of SIGKILL, OOM or
+VM loss. The next supervisor boot logs `prior_unclean_exit`. SIGKILL and lost VMs
+cannot execute a final logger; determining their exact cause requires host-side
+evidence. The previous incident has no recorded final cause; its last successful
+ready event was 2026-10-08 08:31:45 UTC and last status write 08:45:51 UTC.
+
+Commands (starting remains an explicit operator action):
+
+```sh
+python3 -B /workspace/apron-tab-ai-production/service.py status
+python3 -B /workspace/apron-tab-ai-production/service.py start
+python3 -B /workspace/apron-tab-ai-production/service.py stop
+```
+
+At service startup the bot considers at most three recent unanswered explicit
+questions from the latest bounded 64-change same-room history window. Creation
+IDs are server-issued Unix epoch milliseconds under protocol v8: only the past
+15 minutes is eligible, with no future timestamps. Candidates must structurally
+mention the bot or reply to one of its retained messages. Bot/system/self authors,
+edits, deletions, moved messages, newer messages from the same author, existing
+bot replies, nonquestions, URLs and organization/fetch/action commands are skipped.
+This is deliberately conservative and may miss legitimate requests.
+
+Candidates use ordinary text-only inference, the normal rate interval and the
+same $5 atomic budget. Fresh bounded history reads before inference and before
+sending reject newly answered/deleted/edited/superseded requests. No arbitrary
+historical instruction can invoke organizer or URL tools. Missing history means
+no follow-ups; a trusted server-issued room head permits live-only startup,
+otherwise resume still fails closed. History limits may omit older eligible
+questions, and the protocol cannot eliminate the final read/send race.
+
+`followups.json` stores only a SHA-256 opaque scope/message key, attempted or
+acknowledged status, and integer timestamp: no room label, sender or text.
+Attempts for live replies and follow-ups are fsynced before model dispatch; an
+uncertain model/send outcome is never retried on startup. At most 512 records
+are kept for 24 hours; corruption or full capacity fails closed, not by discarding
+uncertain recent attempts. This means a crash before dispatch can also suppress
+a reply. Restart never resets the cumulative spend ledger or greeting claim.
+
+Validation is entirely synthetic: rotating/redacted logs, actual subprocess
+signals and exits, abrupt markers, stale ready diagnosis, recent/old/future and
+answered history, supersession, cap/spacing, restart deduplication, ambiguous send,
+and races during model latency. No live connection, paid call or service restart
+was used for this change. Production receives only operational logging and this
+bounded catch-up feature, not the pending organizer or restricted-fetch code.

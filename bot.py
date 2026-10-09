@@ -16,6 +16,7 @@ import time
 import urllib.error
 import urllib.request
 import uuid
+import catchup
 
 APRON_URL = "wss://server.apron.chat/"
 API_URL = "https://api.darkbloom.dev/v1"
@@ -92,6 +93,7 @@ class Config:
     prior_spend: Decimal = KNOWN_PRIOR_RESERVATION_USD
     ledger: object = field(default=None, repr=False)
     service_mode: bool = False
+    reply_ledger: object = field(default=None, repr=False)
 
     @classmethod
     def from_env(cls, env):
@@ -725,11 +727,31 @@ class Session:
     async def work(self):
         while True:
             user, ident, text, context = await self.queue.get()
+            is_catchup = hasattr(context, 'catchup_snapshot')
+            if is_catchup:
+                await asyncio.sleep(max(0, self.policy.next_call - time.monotonic()))
+                try:
+                    page = await self.rpc('history', {'room_id': self.config.room, 'limit': 64})
+                    eligible = catchup.select(page.get('messages', []), self.config.room, self.policy.you,
+                        int(time.time() * 1000), self.config.humans, (self.config.token, self.config.api_key))
+                    if not any(r == context.catchup_snapshot for r in eligible):
+                        self.stats['catchup_skipped'] += 1
+                        continue
+                except Exception:
+                    self.stats['catchup_skipped'] += 1
+                    continue
             now = time.monotonic()
             if now < self.policy.next_call:
                 self.stats["rate_dropped"] += 1
                 continue
             try:
+                if self.config.reply_ledger is not None:
+                    if not self.config.reply_ledger.claim(self.config.room, ident):
+                        self.stats['catchup_skipped'] += 1
+                        continue
+                if is_catchup:
+                    self.stats['catchup_attempts'] += 1
+                    self.report('catchup_attempt', self)
                 if getattr(context, "fixed_reply", None):
                     reply = context.fixed_reply
                     self.policy.next_call = time.monotonic() + self.config.interval
@@ -758,9 +780,27 @@ class Session:
                 self.report("api_backoff", self)
                 continue
             # The model can supply plain text only, never protocol methods or destinations.
+            if is_catchup:
+                # A fresh bounded read catches edits/answers received during model
+                # latency. No CAS exists: a final read/write race remains possible.
+                try:
+                    page = await self.rpc('history', {'room_id': self.config.room, 'limit': 64})
+                    eligible = catchup.select(page.get('messages', []), self.config.room, self.policy.you,
+                        int(time.time() * 1000), self.config.humans, (self.config.token, self.config.api_key))
+                    if not any(r == context.catchup_snapshot for r in eligible):
+                        self.stats['catchup_skipped'] += 1
+                        continue
+                except Exception:
+                    self.stats['catchup_skipped'] += 1
+                    continue
             sent = await self.rpc("message", {"room_id": self.config.room,
                            "reply_to": {"message_id": ident},
                            "body": {"text": reply, "format": "plain"}})
+            if self.config.reply_ledger is not None:
+                self.config.reply_ledger.acknowledge(self.config.room, ident)
+            if is_catchup:
+                self.stats['catchup_replies'] += 1
+                self.report('catchup_acknowledged', self)
             self.api_failure_streak = 0
             self.stats["replies"] += 1
             self.report("reply_sent", self)
@@ -779,6 +819,7 @@ class Session:
             raise Stop("authentication_failed")
         self.policy.remember_identity(auth.get("you"), current=True)
         self.stats["authenticated"] = 1
+        room_head = None
         # A rotated token is never printed or persisted; this process never reconnects.
         if auth.get("token"):
             self.stats["token_rotation"] += 1
@@ -798,6 +839,10 @@ class Session:
             else:
                 self.stats["joined_rooms"] = len(joined)
                 raise Stop("room_selection_required")
+            for room in rooms.get('joined', []):
+                if room.get('room_id') == self.config.room:
+                    with suppress(Stop):
+                        room_head = log_id(room.get('latest_log_id'))
         elif self.config.room:
             raise Stop("explicit_rooms_unsupported")
         if "rooms" in server.get("capabilities", []) and self.config.room:
@@ -833,18 +878,29 @@ class Session:
             self.stats["hello_acknowledged"] = 1
         self.own_creation_rooms.clear()
         cutoff = log_id(hello.get("message_id")) if hello else None
+        startup_candidates = []
         if "history" in server.get("capabilities", []):
             if not self.config.room:
                 raise Stop("resume_room_unresolved")
             params = {"room_id": self.config.room, "limit": 64}
             if hello:
                 params["before"] = hello["message_id"]
-            recent = await self.rpc("history", params)
+            try:
+                recent = await self.rpc("history", params)
+            except Stop:
+                # No catch-up without a valid history page. A server-issued room
+                # head allows safe live-only startup; without one retain the
+                # existing fail-closed resume behavior.
+                self.stats['catchup_skipped'] += 1
+                recent = {'messages': [], 'latest_log_id': str(cutoff or room_head or 0)}
             snapshots = recent.get("messages", [])
             if not isinstance(snapshots, list):
                 raise Stop("history_invalid")
             for snapshot in snapshots:
                 self.policy.observe(snapshot)
+            if self.config.reply_ledger is not None:
+                startup_candidates = catchup.select(snapshots, self.config.room, self.policy.you,
+                    int(time.time() * 1000), self.config.humans, (self.config.token, self.config.api_key))
             if cutoff is None:
                 cutoff = log_id(recent.get("latest_log_id"))
             del recent, snapshots
@@ -853,6 +909,15 @@ class Session:
             raise Stop("resume_history_required")
         # Never trigger from startup/history or retry a previous connection's work.
         self.policy.watermark = max([cutoff, *self.policy.history.keys()])
+        for row in startup_candidates:
+            if self.queue.full():
+                break
+            ident, user, text = row['message_id'], row['from']['user_id'], row['body']['text']
+            context = self.policy.messages(user, text, ident, self.policy.target({'params': row}))
+            context.catchup_snapshot = row
+            self.queue.put_nowait((user, ident, text, context))
+        self.stats['catchup_candidates'] = len(startup_candidates)
+        self.report('catchup_checked', self)
         self.stats["ready"] = 1
         self.report("ready", self)
         await self.work()

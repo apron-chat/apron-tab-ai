@@ -21,6 +21,7 @@ import time
 import secrets
 
 import bot
+import catchup
 
 DEFAULT_STATE = Path('/workspace/apron-service')
 RECONNECT_BASE_SECONDS = 5
@@ -32,6 +33,7 @@ EVENTS = RESTARTABLE | {
     'prior_unclean_exit', 'service_internal_failure', 'websocket_open', 'websocket_closed',
     'websocket_handshake_failure', 'worker_heartbeat', 'worker_orphaned',
     'deployment_invalid', 'deployment_not_clean', 'singleton_required', 'service_error',
+    'catchup_checked', 'catchup_skipped', 'catchup_attempt', 'catchup_acknowledged',
     'ready', 'call_reserved', 'reply_sent', 'api_backoff', 'api_failure',
     'model_output_metadata', 'operator_stop', 'hard_stop', 'budget_limit',
     'api_authentication', 'api_http', 'api_tls', 'api_unknown', 'operation_failed',
@@ -51,6 +53,7 @@ COUNTS = {'authenticated', 'room_selected', 'history_loaded', 'hello_acknowledge
           'ready', 'eligible', 'calls', 'replies', 'rate_dropped', 'dropped',
           'reply_lookups', 'reply_lookup_failed', 'api_failures', 'backoff_seconds',
           'backoff_dropped', 'token_rotation', 'joined_rooms', 'reference_failures', 'participant_metadata_unavailable'}
+COUNTS |= {'catchup_candidates', 'catchup_skipped', 'catchup_attempts', 'catchup_replies'}
 
 
 def atomic_json(path, data):
@@ -133,6 +136,46 @@ class Ledger:
             except Exception:
                 raise bot.Stop('ledger_invalid') from None
             return True
+
+
+class ReplyLedger:
+    """Bounded opaque IDs/status/time only. Attempt is durable before inference."""
+    def __init__(self, state):
+        self.state = Path(state)
+
+    def update(self, room, ident, acknowledge=False):
+        if catchup.number(ident) is None:
+            raise bot.Stop('ledger_invalid')
+        with (self.state / 'followups.lock').open('a') as lock:
+            fcntl.flock(lock, fcntl.LOCK_EX)
+            path = self.state / 'followups.json'
+            now = int(time.time())
+            try:
+                rows = json.loads(path.read_text()) if path.exists() else {}
+                if not isinstance(rows, dict) or len(rows) > 512:
+                    raise ValueError
+                for k, v in rows.items():
+                    if (not re.fullmatch('[0-9a-f]{64}', k) or not isinstance(v, dict)
+                            or set(v) != {'at', 'status'} or type(v['at']) is not int
+                            or v['status'] not in {'attempted', 'acknowledged'}):
+                        raise ValueError
+                rows = {k: v for k, v in rows.items() if v['at'] >= now - 86400}
+                ident_key = catchup.key(room, ident)
+                if ident_key in rows and not acknowledge:
+                    return False
+                if ident_key not in rows and len(rows) >= 512:
+                    return False  # Never evict recent uncertain attempts to retry.
+                rows[ident_key] = {'at': now, 'status': 'acknowledged' if acknowledge else 'attempted'}
+                atomic_json(path, rows)
+                return True
+            except Exception:
+                raise bot.Stop('ledger_invalid') from None
+
+    def claim(self, room, ident):
+        return self.update(room, ident)
+
+    def acknowledge(self, room, ident):
+        return self.update(room, ident, True)
 
 
 def initialize(state, seed):
@@ -316,6 +359,7 @@ def worker(state):
     env['BOT_BUDGET_USD'] = str(Decimal('5') - ledger.total)
     config = bot.Config.from_env(env)
     config.service_mode, config.ledger = True, ledger
+    config.reply_ledger = ReplyLedger(state)
     reason = asyncio.run(bot.live(config))
     return 75 if reason in RESTARTABLE else 0 if reason == 'operator_stop' else 2
 

@@ -624,7 +624,8 @@ class SessionTests(unittest.IsolatedAsyncioTestCase):
                  patch.object(loop, "add_signal_handler", register), redirect_stdout(output):
                 await bot.live(config(runtime=1))
             records = [json.loads(line) for line in output.getvalue().splitlines()]
-            self.assertEqual(records[0]["status"], "ready")
+            self.assertIn('websocket_open', [r['status'] for r in records])
+            self.assertIn('ready', [r['status'] for r in records])
             self.assertEqual(records[-1]["status"], "operator_stop" if operator_stop else "runtime_limit")
             self.assertNotIn("Synthetic", output.getvalue())
             self.assertNotIn("secret", output.getvalue())
