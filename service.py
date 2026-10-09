@@ -18,6 +18,7 @@ import sys
 import tempfile
 import threading
 import time
+import secrets
 
 import bot
 
@@ -26,6 +27,11 @@ RECONNECT_BASE_SECONDS = 5
 RESTARTABLE = {'connection_closed', 'connection_unavailable', 'api_timeout',
                'api_transport', 'api_parsing', 'api_rate_limit', 'api_http_transient'}
 EVENTS = RESTARTABLE | {
+    'supervisor_started', 'worker_started', 'worker_exit', 'heartbeat',
+    'signal_received', 'shutdown_requested', 'shutdown_complete', 'restart_scheduled',
+    'prior_unclean_exit', 'service_internal_failure', 'websocket_open', 'websocket_closed',
+    'websocket_handshake_failure', 'worker_heartbeat', 'worker_orphaned',
+    'deployment_invalid', 'deployment_not_clean', 'singleton_required', 'service_error',
     'ready', 'call_reserved', 'reply_sent', 'api_backoff', 'api_failure',
     'model_output_metadata', 'operator_stop', 'hard_stop', 'budget_limit',
     'api_authentication', 'api_http', 'api_tls', 'api_unknown', 'operation_failed',
@@ -189,12 +195,66 @@ def safe_event(line):
         for key in ('recoverable', 'content_nonempty'):
             if type(raw.get(key)) is bool:
                 out[key] = raw[key]
-        for key in ('http_status', 'output_length', 'reasoning_tokens'):
-            if type(raw.get(key)) is int and 0 <= raw[key] <= 262144:
+        for key in ('http_status', 'output_length', 'reasoning_tokens', 'signal', 'close_code',
+                    'pid', 'start_ticks', 'boot_id', 'worker_boot_id', 'backoff_seconds',
+                    'restart_count', 'max_rss_kib', 'cpu_ms'):
+            if type(raw.get(key)) is int and 0 <= raw[key] < 2**63:
                 out[key] = raw[key]
+        if type(raw.get('exit_code')) is int and -255 <= raw['exit_code'] <= 255:
+            out['exit_code'] = raw['exit_code']
+        if raw.get('reason') in EVENTS:
+            out['reason'] = raw['reason']
         return out
     except Exception:
         return None
+
+
+class OperationalLog:
+    """Only sanitized enums/numbers reach disk; bounded, flushed and fsynced."""
+    def __init__(self, state, max_bytes=65536):
+        self.state = Path(state)
+        self.boot_id = secrets.randbits(62)
+        self.handler = RotatingFileHandler(self.state / 'metadata.log', maxBytes=max_bytes, backupCount=3)
+        self.handler.setFormatter(logging.Formatter('%(message)s'))
+        self.handler.handleError = lambda record: None  # Never print a logging traceback/payload.
+
+    def emit(self, status, **values):
+        event = safe_event(json.dumps({'status': status, **values}))
+        if event is None:
+            return
+        event.update(utc_epoch=int(time.time()), monotonic_ms=int(time.monotonic() * 1000),
+                     boot_id=self.boot_id)
+        self.handler.emit(logging.makeLogRecord({'msg': json.dumps(event), 'args': ()}))
+        self.handler.flush()
+        os.fsync(self.handler.stream.fileno())
+
+    def begin(self):
+        previous = None
+        with suppress(Exception):
+            previous = json.loads((self.state / 'lifecycle.json').read_text())
+        if isinstance(previous, dict) and previous.get('clean_exit') is False:
+            self.emit('prior_unclean_exit')
+        elif previous is None:
+            with suppress(Exception):
+                old = json.loads((self.state / 'status.json').read_text())
+                if old.get('state') in {'ready', 'starting', 'reconnect_backoff'}:
+                    self.emit('prior_unclean_exit')
+        atomic_json(self.state / 'lifecycle.json', {'boot_id': self.boot_id, 'clean_exit': False,
+                    'pid': os.getpid(), 'start_ticks': process_start(os.getpid()), 'utc_epoch': int(time.time())})
+        self.emit('supervisor_started', pid=os.getpid(), start_ticks=process_start(os.getpid()))
+
+    def finish(self):
+        self.emit('shutdown_complete')
+        atomic_json(self.state / 'lifecycle.json', {'boot_id': self.boot_id, 'clean_exit': True,
+                    'pid': os.getpid(), 'start_ticks': process_start(os.getpid()), 'utc_epoch': int(time.time())})
+
+    def close(self):
+        self.handler.close()
+
+
+def resource_metrics():
+    usage = resource.getrusage(resource.RUSAGE_SELF)
+    return {'max_rss_kib': int(usage.ru_maxrss), 'cpu_ms': int((usage.ru_utime + usage.ru_stime) * 1000)}
 
 
 def deployment(state, create=False):
@@ -231,15 +291,25 @@ def worker(state):
     logging.disable(logging.CRITICAL)
     resource.setrlimit(resource.RLIMIT_CORE, (0, 0))
     parent, stamp = os.getppid(), process_start(os.getppid())
+    boot = secrets.randbits(62)
+    print(json.dumps({'status': 'worker_started', 'worker_boot_id': boot,
+                      'pid': os.getpid(), 'start_ticks': process_start(os.getpid())}), flush=True)
 
     def orphan_watch():
         while True:
             time.sleep(2)
             if process_start(parent) != stamp:
+                print('{"status":"worker_orphaned"}', flush=True)
                 os.kill(os.getpid(), signal.SIGTERM)
                 return
 
+    def heartbeat():
+        while True:
+            time.sleep(30)
+            print(json.dumps({'status': 'worker_heartbeat', 'worker_boot_id': boot, **resource_metrics()}), flush=True)
+
     threading.Thread(target=orphan_watch, daemon=True).start()
+    threading.Thread(target=heartbeat, daemon=True).start()
     ledger = Ledger(state)
     env = dict(os.environ)  # In-memory inheritance only; never serialize credentials.
     env['BOT_PRIOR_SPEND_USD'] = str(ledger.total)
@@ -257,17 +327,17 @@ def supervise(state, lock_fd):
     deploy = deployment(state)
     ledger.read()
     stopped = threading.Event()
+    received_signal = [0]
+    def stop_signal(signum, frame):
+        received_signal[0] = signum
+        stopped.set()
     for sig in (signal.SIGTERM, signal.SIGINT):
-        signal.signal(sig, lambda *_: stopped.set())
-    handler = RotatingFileHandler(state / 'metadata.log', maxBytes=65536, backupCount=3)
-    handler.setFormatter(logging.Formatter('%(message)s'))
-    logger = logging.getLogger('safe-service')
-    logger.setLevel(logging.INFO)
-    logger.propagate = False
-    logger.addHandler(handler)
+        signal.signal(sig, stop_signal)
+    operational = OperationalLog(state)
+    operational.begin()
     record = {'state': 'starting', 'supervisor_pid': os.getpid(), 'supervisor_start': process_start(os.getpid()),
               'worker_pid': None, 'worker_start': None, 'commit': deploy['commit'],
-              'restarts': 0, 'ready': False, 'counts': {}}
+              'restarts': 0, 'ready': False, 'counts': {}, 'boot_id': operational.boot_id, 'clean_exit': False}
 
     def save():
         record['updated_utc_epoch'] = int(time.time())
@@ -279,12 +349,22 @@ def supervise(state, lock_fd):
         event = safe_event(line)
         if event is None:
             return
-        logger.info(json.dumps({'utc_epoch': int(time.time()), **event}, separators=(',', ':')))
+        operational.emit(**event)
         record['last_event'] = event['status']
+        if event['status'] not in {'heartbeat', 'worker_heartbeat'}:
+            record['last_operational_event'] = event['status']
+        if event['status'] in RESTARTABLE or event['status'] in {'api_failure', 'websocket_closed', 'websocket_handshake_failure'}:
+            record['last_error'] = event
+        if event['status'] == 'worker_heartbeat':
+            record['worker_heartbeat_utc'] = int(time.time())
+        if 'worker_boot_id' in event:
+            record['worker_boot_id'] = event['worker_boot_id']
         if 'counts' in event:
             record['counts'] = event['counts']
         if event['status'] == 'ready':
             record.update(state='ready', ready=True)
+        if event['status'] in {'websocket_closed', 'connection_unavailable', 'connection_closed'}:
+            record['ready'] = False
         save()
 
     delay = RECONNECT_BASE_SECONDS
@@ -300,13 +380,18 @@ def supervise(state, lock_fd):
                                      stdout=subprocess.PIPE, stderr=subprocess.DEVNULL, stdin=subprocess.DEVNULL,
                                      pass_fds=(lock_fd,), cwd=deploy['root'])
             record.update(worker_pid=child.pid, worker_start=process_start(child.pid))
+            operational.emit('worker_started', pid=child.pid, start_ticks=record['worker_start'])
             save()
             started = time.monotonic()
+            next_heartbeat = started
             with selectors.DefaultSelector() as selector:
                 selector.register(child.stdout, selectors.EVENT_READ)
                 buffer = b''
                 while child.poll() is None:
                     if stopped.is_set() or (state / 'stop.request').exists():
+                        operational.emit('shutdown_requested', signal=received_signal[0])
+                        if received_signal[0]:
+                            operational.emit('signal_received', signal=received_signal[0])
                         child.terminate()
                         try:
                             child.wait(timeout=7)
@@ -323,10 +408,19 @@ def supervise(state, lock_fd):
                             accept(line)
                         if len(buffer) > 16384:
                             buffer = b''
+                    if time.monotonic() >= next_heartbeat:
+                        operational.emit('heartbeat', pid=os.getpid(), **resource_metrics())
+                        record['heartbeat_utc'] = int(time.time())
+                        next_heartbeat = time.monotonic() + 30
                     save()
                 for line in child.stdout.read(65536).splitlines():
                     accept(line)
             code = child.wait()
+            record['worker_exit_code'] = code
+            record['worker_exit_signal'] = -code if code < 0 else 0
+            reason = record.get('last_operational_event', 'operation_failed')
+            operational.emit('worker_exit', exit_code=code, signal=-code if code < 0 else 0,
+                             reason=reason if reason in EVENTS else 'operation_failed')
             child.stdout.close()
             record.update(worker_pid=None, worker_start=None, ready=False)
             if stopped.is_set() or code != 75:
@@ -335,6 +429,8 @@ def supervise(state, lock_fd):
             record['restarts'] += 1
             record['state'] = 'reconnect_backoff'
             record['backoff_seconds'] = delay
+            operational.emit('restart_scheduled', backoff_seconds=delay, restart_count=record['restarts'],
+                             reason=reason if reason in EVENTS else 'operation_failed')
             save()
             if time.monotonic() - started > 60:
                 delay = RECONNECT_BASE_SECONDS
@@ -349,6 +445,7 @@ def supervise(state, lock_fd):
     except Exception:
         record.update(state='halted', ready=False, last_event='service_internal_failure')
         with suppress(Exception):
+            operational.emit('service_internal_failure')
             save()
     finally:
         if child and child.poll() is None:
@@ -358,7 +455,13 @@ def supervise(state, lock_fd):
             except subprocess.TimeoutExpired:
                 child.kill()
                 child.wait()
-        handler.close()
+        with suppress(Exception):
+            record.update(clean_exit=True, ready=False)
+            if received_signal[0]:
+                record['shutdown_signal'] = received_signal[0]
+            save()
+            operational.finish()
+        operational.close()
 
 
 def status(state):
@@ -375,6 +478,19 @@ def status(state):
     saved['reserved_attempts'] = ledger.read()['attempts']
     if saved.get('ready') and not saved['worker_alive']:
         saved['ready'] = False
+    age = max(0, int(time.time()) - saved.get('updated_utc_epoch', 0))
+    saved['status_age_seconds'] = age
+    saved['status_stale'] = age > 90
+    if saved['status_stale'] or not saved['supervisor_alive']:
+        saved['ready'] = False
+    if not saved['supervisor_alive'] and not saved['worker_alive']:
+        if saved.get('clean_exit') is not True and saved.get('state') not in {'stopped', 'halted', 'not_started'}:
+            saved['state'] = 'unclean_stop'
+            saved['diagnosis'] = 'unknown_abrupt_stop_environment_loss_possible'
+        else:
+            saved['diagnosis'] = 'recorded_clean_exit' if saved.get('clean_exit') else 'not_running'
+    else:
+        saved['diagnosis'] = 'stale_heartbeat' if saved['status_stale'] else 'running'
     return saved
 
 
@@ -433,9 +549,19 @@ def main():
         if code not in EVENTS | {'already_initialized', 'already_running', 'deployment_invalid', 'deployment_not_clean', 'singleton_required'}:
             code = 'service_error'
         print(json.dumps({'status': code}), flush=True)
+        if args.action in {'start', 'supervise'} and state.is_dir():
+            with suppress(Exception):
+                log = OperationalLog(state)
+                log.emit(code)
+                log.close()
         return 2
     except Exception:
         print('{"status":"service_error"}', flush=True)
+        if args.action in {'start', 'supervise'} and state.is_dir():
+            with suppress(Exception):
+                log = OperationalLog(state)
+                log.emit('service_error')
+                log.close()
         return 2
 
 

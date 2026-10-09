@@ -949,11 +949,12 @@ async def live(config):
         cumulative = config.prior_spend
         if session:
             cumulative += session.policy.reserved
-        record = {"status": "hard_stop", "cumulative_reserved_usd": str(cumulative)}
+        record = {"status": "hard_stop", "signal": signum, "cumulative_reserved_usd": str(cumulative)}
         os.write(1, (json.dumps(record) + "\n").encode())
         os._exit(0)
 
-    def request_stop():
+    def request_stop(signum=0):
+        print(json.dumps({'status': 'signal_received', 'signal': signum}), flush=True)
         signal.alarm(5)
         stop_event.set()
 
@@ -961,20 +962,26 @@ async def live(config):
     if not config.service_mode:
         signal.alarm(config.runtime + 5)
     for sig in (signal.SIGINT, signal.SIGTERM):
-        loop.add_signal_handler(sig, request_stop)
+        loop.add_signal_handler(sig, lambda signum=sig: request_stop(signum))
 
     async def connected():
         nonlocal session
         async with FixedConnection(APRON_URL, compression=None,
                                    open_timeout=15, close_timeout=2,
                                    max_size=262144, max_queue=8) as ws:
+            print('{"status":"websocket_open"}', flush=True)
             def report(status, current):
                 print(json.dumps({"status": status, "counts": dict(current.stats),
                                   "cumulative_reserved_usd": str(config.prior_spend + current.policy.reserved)}),
                       flush=True)
 
             session = Session(ws, config, Darkbloom(config), report)
-            await session.run()
+            try:
+                await session.run()
+            finally:
+                code = getattr(ws, 'close_code', None)
+                if type(code) is int:
+                    print(json.dumps({'status': 'websocket_closed', 'close_code': code}), flush=True)
 
     task = asyncio.create_task(connected())
     stopper = asyncio.create_task(stop_event.wait())
@@ -991,8 +998,13 @@ async def live(config):
         reason = "api_http_transient" if isinstance(exc, ApiFailure) and exc.category == "http" and exc.transient else str(exc)
     except InvalidStatus as exc:
         code = exc.response.status_code
+        print(json.dumps({'status': 'websocket_handshake_failure', 'http_status': code}), flush=True)
         reason = "connection_unavailable" if code in (408, 429) or 500 <= code <= 599 else "authentication_failed" if code in (401, 403) else "protocol_invalid"
-    except (OSError, TimeoutError, ConnectionClosed):
+    except ConnectionClosed as exc:
+        code = exc.rcvd.code if exc.rcvd else 1006
+        print(json.dumps({'status': 'websocket_closed', 'close_code': code}), flush=True)
+        reason = "connection_unavailable"
+    except (OSError, TimeoutError):
         reason = "connection_unavailable"
     except Exception:
         reason = "operation_failed"
